@@ -10,6 +10,7 @@
 #include <chrono>
 #include <iostream>
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 #include <memory>
 #include <limits>
@@ -66,7 +67,8 @@ int main(int argc, char *argv[])
 
         if (n_thread < 3)
         {
-            throw std::invalid_argument("n_thread must be >= 3");
+            std::cerr << "n_thread must be >= 3" << std::endl;
+            std::exit(-1);
         }
 
         std::cout << "Input parameters:" << std::endl;

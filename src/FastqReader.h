@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <utility>
 #include <iostream>
+#include <cstdlib>
 
 template <uint32_t N>
 class FastqReader
@@ -38,12 +39,14 @@ public:
 
         if (ring_memory_pool_ptr_ == nullptr)
         {
-            throw std::invalid_argument("RingMemoryPool pointer is null");
+            std::cerr << "RingMemoryPool pointer is null" << std::endl;
+            std::exit(-1);
         }
         fd_ = ::open(filename.data(), O_RDONLY | O_LARGEFILE);
         if (fd_ == -1)
         {
-            throw std::runtime_error("Failed to open file");
+            std::cerr << "Failed to open file" << std::endl;
+            std::exit(-1);
         }
 
         posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL); // 顺序访问提示
@@ -51,7 +54,8 @@ public:
         struct stat st;
         if (fstat(fd_, &st) == -1)
         {
-            throw std::runtime_error("Failed to get file size");
+            std::cerr << "Failed to get file size" << std::endl;
+            std::exit(-1);
         }
 
         file_size_ = st.st_size;
@@ -104,7 +108,8 @@ public:
                 const ssize_t bytes_read = ::read(fd_, file_buffer_.data(), chunk_size_);
                 if (bytes_read < 0) [[unlikely]]
                 {
-                    throw std::runtime_error("Failed to read fastq data");
+                    std::cerr << "Failed to read fastq data" << std::endl;
+                    std::exit(-1);
                 }
 
                 if (bytes_read == 0)

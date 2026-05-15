@@ -6,7 +6,9 @@
 #include "kmer.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
+#include <iostream>
 #include <stdexcept>
 #include <vector>
 #include <array>
@@ -47,10 +49,12 @@ public:
     {
         for (uint64_t i = 0; i < files.size(); ++i)
         {
-            files[i] = std::fopen((temp_dir + "low_" + std::to_string(i) + ".bin").c_str(), "wb");
+            const std::string filename = temp_dir + "low_" + std::to_string(i) + ".bin";
+            files[i] = std::fopen(filename.c_str(), "wb");
             if (files[i] == nullptr) [[unlikely]]
             {
-                throw std::runtime_error("Failed to open export file: " + temp_dir + "low_" + std::to_string(i) + ".bin");
+                std::cerr << "Failed to open export file: " << filename << std::endl;
+                std::exit(-1);
             }
             root_buffers[i].reserve(ROOT_BUFFER_KMER_CAPACITY);
         }
@@ -181,7 +185,8 @@ private:
         const size_t data_size = buffer.size();
         if (std::fwrite(buffer.data(), sizeof(kmer<N>), data_size, files[root_prefix]) != data_size) [[unlikely]]
         {
-            throw std::runtime_error("Failed to write k-mer data");
+            std::cerr << "Failed to write k-mer data" << std::endl;
+            std::exit(-1);
         }
         buffer.clear();
     }

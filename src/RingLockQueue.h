@@ -6,6 +6,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <cassert>
+#include <cstdlib>
+#include <iostream>
 
 template <typename T, uint64_t CAPACITY = 4096>
 class RingLockQueue
@@ -19,7 +21,8 @@ public:
     {
         if (active_producers == 0)
         {
-            throw std::invalid_argument("RingLockQueue active_producers must be > 0");
+            std::cerr << "RingLockQueue active_producers must be > 0" << std::endl;
+            std::exit(-1);
         }
     }
 

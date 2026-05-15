@@ -12,6 +12,8 @@
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+#include <cstdlib>
+#include <iostream>
 
 template <uint64_t CAPACITY = 4096>
 class RingMemoryPool
@@ -28,11 +30,13 @@ public:
     {
         if (CAPACITY == 0)
         {
-            throw std::invalid_argument("RingMemoryPool capacity must be > 0");
+            std::cerr << "RingMemoryPool capacity must be > 0" << std::endl;
+            std::exit(-1);
         }
         if (block_size_ == 0)
         {
-            throw std::invalid_argument("RingMemoryPool block_size_ must be > 0");
+            std::cerr << "RingMemoryPool block_size_ must be > 0" << std::endl;
+            std::exit(-1);
         }
 
         char *base = memory_pool_.data();
@@ -113,12 +117,14 @@ private:
         }
         if (capacity > (std::numeric_limits<uint64_t>::max() / block_size))
         {
-            throw std::invalid_argument("RingMemoryPool capacity * block_size_ overflow");
+            std::cerr << "RingMemoryPool capacity * block_size_ overflow" << std::endl;
+            std::exit(-1);
         }
         const uint64_t bytes = capacity * block_size;
         if (bytes > std::numeric_limits<size_t>::max())
         {
-            throw std::invalid_argument("RingMemoryPool pool size exceeds size_t");
+            std::cerr << "RingMemoryPool pool size exceeds size_t" << std::endl;
+            std::exit(-1);
         }
         return bytes;
     }

@@ -4,7 +4,9 @@
 #include "definition.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <string>
+#include <iostream>
 #include <stdexcept>
 #include <type_traits>
 
@@ -28,12 +30,14 @@ public:
         out_file = std::fopen(file_name.c_str(), "wb+");
         if (out_file == nullptr)
         {
-            throw std::runtime_error("failed to open final drain output file");
+            std::cerr << "failed to open final drain output file" << std::endl;
+            std::exit(-1);
         }
         if (std::setvbuf(out_file, nullptr, _IOFBF, kFileBufferSize) != 0)
         {
             std::fclose(out_file);
-            throw std::runtime_error("failed to set buffer size for final drain output file");
+            std::cerr << "failed to set buffer size for final drain output file" << std::endl;
+            std::exit(-1);
         }
     }
 

@@ -10,6 +10,8 @@
 #include <stdexcept>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cstdlib>
+#include <iostream>
 
 template <uint32_t N>
 class ExportReader
@@ -39,11 +41,12 @@ public:
 
     void open(const uint64_t prefix)
     {
-        std::string filename = temp_dir + "low_" + std::to_string(prefix) + ".bin";
+        const std::string filename = temp_dir + "low_" + std::to_string(prefix) + ".bin";
         file = std::fopen(filename.c_str(), "rb");
         if (!file) [[unlikely]]
         {
-            throw std::runtime_error("Failed to open file: " + filename);
+            std::cerr << "Failed to open file: " << filename << std::endl;
+            std::exit(-1);
         }
 
         struct stat st;
@@ -51,7 +54,8 @@ public:
         {
             std::fclose(file);
             file = nullptr;
-            throw std::runtime_error("Failed to stat file: " + filename);
+            std::cerr << "Failed to stat file: " << filename << std::endl;
+            std::exit(-1);
         }
         kmer_amount = st.st_size / sizeof(kmer<N>);
     }

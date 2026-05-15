@@ -14,6 +14,8 @@
 #include <stdexcept>
 #include <new>
 #include <algorithm>
+#include <cstdlib>
+#include <iostream>
 
 // 系统头文件
 #include <sys/mman.h>
@@ -322,7 +324,8 @@ inline ConcurrentMemoryPool::ConcurrentMemoryPool(size_t total_bytes, size_t num
     total_blocks_ = total_bytes / BLOCK_SIZE;
     if (total_blocks_ == 0)
     {
-        throw std::invalid_argument("total_bytes must be at least BLOCK_SIZE (4096)");
+        std::cerr << "total_bytes must be at least BLOCK_SIZE (4096)" << std::endl;
+        std::exit(-1);
     }
 
     // 分配内存并设置 Arena 地址范围
@@ -459,7 +462,8 @@ inline void ConcurrentMemoryPool::allocate_memory(size_t total_bytes)
 
         if (addr == MAP_FAILED)
         {
-            throw std::bad_alloc();
+            std::cerr << "std::bad_alloc" << std::endl;
+            std::exit(-1);
         }
 
         memory_start_ = addr;
@@ -802,7 +806,8 @@ inline void *ConcurrentMemoryPool::allocate_large(size_t bytes)
         }
     }
 
-    throw std::bad_alloc();
+    std::cerr << "std::bad_alloc" << std::endl;
+    std::exit(-1);
 }
 
 inline void *ConcurrentMemoryPool::allocate()
@@ -863,7 +868,8 @@ inline void *ConcurrentMemoryPool::allocate()
     }
 
     // 4. 所有 Arena 都为空
-    throw std::bad_alloc();
+    std::cerr << "std::bad_alloc" << std::endl;
+    std::exit(-1);
 }
 
 inline void ConcurrentMemoryPool::deallocate(void *ptr)
