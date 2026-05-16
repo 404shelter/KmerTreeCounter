@@ -47,7 +47,7 @@ public:
         // const uint64_t h1 = hash_res1.low64;
         // const uint64_t h2 = hash_res1.high64 | 1ULL;
         const uint64_t h1=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_A);
-        const uint64_t h2=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_D) | 1ULL;
+        const uint64_t h2=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_B) | 1ULL;
         const uint64_t block1_idx = 2 * (h1 & mod);
         const uint64_t insert_num1 = calculate_insert_num(h1, h2);
         const uint64_t snapshot1 = filter_bins[block1_idx].load(std::memory_order_relaxed);

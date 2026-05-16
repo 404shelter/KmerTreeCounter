@@ -16,7 +16,6 @@
 template <uint32_t N>
 class ExportReader
 {
-
     std::FILE *file;
     uint64_t kmer_amount;
 
@@ -26,7 +25,7 @@ public:
     ExportReader(ExportReader &&) = delete;
     ExportReader &operator=(ExportReader &&) = delete;
 
-    explicit ExportReader() : file(nullptr),kmer_amount(0)
+    explicit ExportReader() : file(nullptr), kmer_amount(0)
     {
     }
 
@@ -49,15 +48,17 @@ public:
             std::exit(-1);
         }
 
-        struct stat st;
-        if (fstat(fileno(file), &st) != 0) [[unlikely]]
+        // 读取 4KB header，获取实际 kmer 数量
+        alignas(PAGE_SIZE) char header[PAGE_SIZE];
+        size_t readn = std::fread(header, 1, PAGE_SIZE, file);
+        if (readn == PAGE_SIZE)
         {
-            std::fclose(file);
-            file = nullptr;
-            std::cerr << "Failed to stat file: " << filename << std::endl;
-            std::exit(-1);
+            kmer_amount = *reinterpret_cast<uint64_t *>(header);
         }
-        kmer_amount = st.st_size / sizeof(kmer<N>);
+        else
+        {
+            kmer_amount = 0;
+        }
     }
 
     void close()
@@ -76,11 +77,9 @@ public:
 
     uint64_t read_kmers(kmer<N> *buffer, uint64_t max_kmers_to_read)
     {
-        uint64_t read_size = std::fread(buffer, sizeof(kmer<N>), max_kmers_to_read, file);
-        uint64_t read_count = read_size / sizeof(kmer<N>);
+        uint64_t read_count = std::fread(buffer, sizeof(kmer<N>), max_kmers_to_read, file);
         return read_count;
     }
-
 };
 
 #endif

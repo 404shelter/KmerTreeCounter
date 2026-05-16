@@ -15,17 +15,16 @@
 #include <string>
 #include <unordered_map>
 
-
 constexpr uint64_t PAGE_SIZE = 4096;
 
 constexpr uint64_t BASES_PER_U64T = 32;
-constexpr uint64_t KMER_BLOCK_SIZE = 4096; // 单个小 k-mer 块大小
+constexpr uint64_t KMER_BLOCK_SIZE = 4096;         // 单个小 k-mer 块大小
 inline constexpr uint32_t MAX_KMER_BLOCK_NUM = 16; // 单个节点能挂载的最大 k-mer 块数量
 
 // 树的结构参数
 constexpr uint32_t NODE_BASES = 2; // 普通节点的字典基数 (即碱基数, 2^(2*2) = 16 叉树)
 constexpr uint32_t ROOT_BASES = 4; // 根节点的字典基数 (即碱基数, 2^(2*4) = 256 叉树)
-constexpr uint32_t MAX_DEPTH = 4; // 树的最大深度 (第 4 层将自动合并进挂载的哈希表)
+constexpr uint32_t MAX_DEPTH = 4;  // 树的最大深度 (第 4 层将自动合并进挂载的哈希表)
 constexpr uint32_t NODE_SIZE = 256;
 
 constexpr size_t CACHE_LINE_SIZE = 64;
@@ -56,7 +55,7 @@ struct content_type
 };
 
 // 解析线程配置常量
-constexpr double TASK_PARSER_RATIO = 1.5;                  // 解析与任务线程比例
+constexpr double TASK_PARSER_RATIO = 1;                  // 解析与任务线程比例
 constexpr uint64_t PARSER_KMER_BUFFER_SIZE = 16ULL * 1024; // 解析线程内部 k-mer 缓冲区大小，单位为字节
 
 // 任务线程配置常量
@@ -89,7 +88,7 @@ constexpr uint64_t KMER_BATCH_SIZE = 1024; // KmerBatch 的总大小（字节）
 
 // ExportWriter配置常量
 constexpr uint64_t EXPORT_FILES_SIZE = 1ULL << (2 * ROOT_BASES); // 最大同时打开文件数量
-constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 8 * 1024;           // 每个根节点的导出缓冲区大小（字节）
+constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;                                          // 每个根节点的导出缓冲区大小（字节）
 
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
