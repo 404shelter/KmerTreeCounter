@@ -19,43 +19,50 @@
 #include <chrono>
 
 template <uint32_t N>
-class ParserThreadPool final
+class ParserThreadPool
 {
+
+    int k;
+    KmerTree<N> *tree = nullptr;
+    ConcurrentMemoryPool *pool = nullptr;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *reader_parser_ring_pool;
+    RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *parser_classifier_ring_pool;
+    std::vector<std::unique_ptr<std::thread>> threads_ptr;
+    const uint32_t parser_count;
+    std::atomic<uint64_t> total_read_kmer = 0;
+
 public:
     explicit ParserThreadPool(const int in_k, KmerTree<N> *tree_ptr,
                               ConcurrentMemoryPool *pool_ptr,
-                              RingMemoryPool<RING_MEMORY_POOL_CAPACITY> *ring_pool_ptr,
-                              SchedulerThreadPool<N> *task_thread_pool_ptr,
-                              uint32_t worker_count)
+                              RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool_ptr,
+                              RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool_ptr,
+                              uint32_t in_parser_count)
         : k(in_k),
-          tree_(tree_ptr),
-          pool_(pool_ptr),
-          ring_pool_(ring_pool_ptr),
-          task_thread_pool_(task_thread_pool_ptr),
-          worker_count_(worker_count == 0 ? 1u : worker_count)
+          tree(tree_ptr),
+          pool(pool_ptr),
+          reader_parser_ring_pool(in_reader_parser_ring_pool_ptr),
+          parser_classifier_ring_pool(in_parser_classifier_ring_pool_ptr),
+          parser_count(in_parser_count)
     {
-        threads_ptr_.reserve(worker_count_);
+        threads_ptr.reserve(parser_count);
     }
 
     void start()
     {
-        for (uint32_t i = 0; i < worker_count_; ++i)
+        for (uint32_t i = 0; i < parser_count; ++i)
         {
-            threads_ptr_.push_back(std::make_unique<std::thread>([&]
-                                                                 {
-				FastqParser<N> parser(k, ring_pool_, tree_, pool_);
+            threads_ptr.push_back(std::make_unique<std::thread>([&]
+                                                                {
+				FastqParser<N> parser(k, reader_parser_ring_pool, parser_classifier_ring_pool, tree);
 				parser.parse_and_push();
-				//pool_->flush_all_thread_caches_to_central();
-				pool_->reclaim_thread_cache();
 				total_read_kmer += parser.get_total_read_kmer();
-                SpinLock::flush_spin_loops_for_current_thread();
-                task_thread_pool_->mark_producer_done(); }));
+                parser_classifier_ring_pool->producer_set_finished(); }));
         }
     }
 
     void join()
     {
-        for (auto &t : threads_ptr_)
+        for (auto &t : threads_ptr)
         {
             if (t->joinable())
             {
@@ -74,15 +81,6 @@ public:
         total_read_kmer.fetch_add(count, std::memory_order_acq_rel);
     }
 
-private:
-    int k;
-    KmerTree<N> *tree_ = nullptr;
-    ConcurrentMemoryPool *pool_ = nullptr;
-    RingMemoryPool<RING_MEMORY_POOL_CAPACITY> *ring_pool_ = nullptr;
-    std::vector<std::unique_ptr<std::thread>> threads_ptr_;
-    SchedulerThreadPool<N> *task_thread_pool_ = nullptr;
-    const uint32_t worker_count_;
-    std::atomic<uint64_t> total_read_kmer = 0;
 };
 
 #endif // PARSER_THREAD_POOL_HEADER

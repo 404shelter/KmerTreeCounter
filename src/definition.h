@@ -40,12 +40,17 @@ constexpr uint64_t BATCH_RETURN_SIZE = 32;    // 批量归还数量
 static_assert(KMER_BLOCK_SIZE % 4096 == 0, "KMER_BLOCK_SIZE must be multiple of 4096 bytes");
 
 // Reader与Parser之间的RingMemoryPool配置常量
-constexpr uint64_t RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 环形内存池容量（块数），必须为2的幂
-constexpr uint64_t RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024; // 环形内存池块大小（字节）
+constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 环形内存池容量（块数），必须为2的幂
+constexpr uint64_t READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024; // 环形内存池块大小（字节）
+
+// Parser与Classifier之间的RingMemoryPool配置常量
+constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY = 1ULL << 12;     // 环形内存池容量（块数），必须为2的幂
+constexpr uint64_t PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE = 64ULL * 1024; // 环形内存池块大小（字节）
 
 // 写入文件部分的RingMemoryPool配置常量
 constexpr uint64_t EXPORT_RING_MEMORY_POOL_CAPACITY = 1ULL << 10;                       // 导出环形内存池容量（块数），必须为2的幂
-constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = MAX_KMER_BLOCK_NUM * PAGE_SIZE; // 导出环形内存池块大小（字节）
+constexpr uint64_t EXPORT_RING_MEMORY_POOL_BLOCK_SIZE = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE; // 导出环形内存池块大小（字节）
+
 
 // RingMemoryPool 生产者队列的内容
 struct content_type
@@ -55,8 +60,8 @@ struct content_type
 };
 
 // 解析线程配置常量
-constexpr double TASK_PARSER_RATIO = 1;                  // 解析与任务线程比例
-constexpr uint64_t PARSER_KMER_BUFFER_SIZE = 16ULL * 1024; // 解析线程内部 k-mer 缓冲区大小，单位为字节
+constexpr double TASK_CLASSIFIER_RATIO = 1;                  // 解析与任务线程比例
+//constexpr uint64_t PARSER_KMER_BUFFER_SIZE = 16ULL * 1024; // 解析线程内部 k-mer 缓冲区大小，单位为字节
 
 // 任务线程配置常量
 constexpr uint32_t LOCAL_STACK_SIZE = 64;

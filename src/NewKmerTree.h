@@ -320,7 +320,7 @@ public:
         }
     }
 
-    void main_add_kmer_block_with_local_root_nodes(std::array<kmer<N>, PARSER_KMER_BUFFER_SIZE / sizeof(kmer<N>)> &kmer_block_for_copy, std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> &kmer_prefix_counts, node<N> *local_root_nodes)
+    void main_add_kmer_block_with_local_root_nodes(std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> &kmer_block_for_copy, std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> &kmer_prefix_counts, node<N> *local_root_nodes)
     {
         Task<N> task{};
 

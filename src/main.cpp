@@ -6,6 +6,7 @@
 #include "FastqReader.h"
 #include "ParserThreadPool.h"
 #include "ExportWriter.h"
+#include "ClassifierThreadPool.h"
 
 #include <chrono>
 #include <iostream>
@@ -16,15 +17,14 @@
 #include <limits>
 #include <format>
 
-
-uint32_t k_len; // k-mer 的长度 (例如: 31, 41)
-uint32_t n_thread; // 允许使用的总线程数
+uint32_t k_len;        // k-mer 的长度 (例如: 31, 41)
+uint32_t n_thread;     // 允许使用的总线程数
 uint64_t memory_limit; // 全局最大内存限制，单位为 GB
 
 int main(int argc, char *argv[])
 {
 
-    if (argc < 5 || argc > 10)
+    if (argc < 5 || argc > 9)
     {
         std::cerr << "Usage: " << argv[0]
                   << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> [map_capacity] [min_count] [max_count] [parser_threads]" << std::endl;
@@ -55,19 +55,10 @@ int main(int argc, char *argv[])
         {
             max_count = std::stoul(argv[7]);
         }
-        if (argc >= 9)
-        {
-            parser_threads_override = std::stoul(argv[8]);
-            if (parser_threads_override <= 0 || parser_threads_override >= n_thread)
-            {
-                std::cerr << "parser_threads must be > 0 and < n_thread" << std::endl;
-                return 1;
-            }
-        }
 
-        if (n_thread < 3)
+        if (n_thread < 6)
         {
-            std::cerr << "n_thread must be >= 3" << std::endl;
+            std::cerr << "n_thread must be >= 6" << std::endl;
             std::exit(-1);
         }
 
@@ -79,10 +70,6 @@ int main(int argc, char *argv[])
         std::cout << "  Map capacity: " << kmer_concurrent_hash_map_capacity << std::endl;
         std::cout << "  Min count: " << min_count << std::endl;
         std::cout << "  Max count: " << max_count << std::endl;
-        if (parser_threads_override > 0)
-        {
-            std::cout << "  Parser threads override: " << parser_threads_override << std::endl;
-        }
     }
     catch (const std::exception &)
     {
@@ -101,23 +88,11 @@ int main(int argc, char *argv[])
     constexpr uint32_t N1 = 2;
 
     // 根据预算计算分给 Worker 的解析(Parser)线程和任务(Tasker)线程的数量
-    // Worker 预算去除了主线程(Reader)和导出线程(ExportWriter) 
-    const uint32_t worker_budget = n_thread - 2;
-    uint32_t parser_num = 1 + (worker_budget - 1) / (1 + TASK_PARSER_RATIO);
-    if (parser_threads_override > 0)
-    {
-        parser_num = parser_threads_override;
-    }
-    if (parser_num == 0)
-    {
-        parser_num = 1;
-    }
-    if (parser_num >= worker_budget)
-    {
-        parser_num = worker_budget;
-    }
-    uint32_t tasker_num = worker_budget - parser_num;
-    tasker_num = tasker_num > 0 ? tasker_num : 1;
+    // Worker 预算去除了主线程(Reader)和导出线程(ExportWriter)
+    const uint32_t worker_budget = n_thread - 4;
+    const uint32_t parser_num = 2;
+    const uint32_t classifier_num = worker_budget / (1.0 + TASK_CLASSIFIER_RATIO);
+    const uint32_t tasker_num = worker_budget - classifier_num;
 
     std::cout << "Thread split:" << std::endl;
     std::cout << "  parser threads: " << parser_num << std::endl;
@@ -127,8 +102,10 @@ int main(int argc, char *argv[])
 
     // 初始化层级队列，用于在树的不同深度间传递任务
     auto layer_queues = std::make_shared<LayerQueues<N1>>();
-    // 初始化解析器环形内存池，管理 Parser 解析后的 k-mer 数据块
-    auto ring_pool = std::make_shared<RingMemoryPool<RING_MEMORY_POOL_CAPACITY>>(RING_MEMORY_POOL_BLOCK_SIZE, 1, parser_num + 1);
+    // 初始化解析器环形内存池，管理 Reader 读取后的碱基字符串数据块
+    auto reader_parser_ring_pool = std::make_shared<RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, 1, parser_num);
+    // 初始化分类器环形内存池，管理 Parser 线程处理后的 k-mer 数据块
+    auto parser_classifier_ring_pool = std::make_shared<RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>>(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE, 1, classifier_num + 1);
     // 初始化导出用的环形内存池，管理低频 k-mer 的导出数据块
     auto export_ring_pool = std::make_shared<RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>>(EXPORT_RING_MEMORY_POOL_BLOCK_SIZE, 1, 1);
     // 初始化全局并发内存池，用于节点分配、哈希表等
@@ -138,9 +115,11 @@ int main(int argc, char *argv[])
     auto tree = std::make_shared<KmerTree<N1>>(k_len, pool.get(), layer_queues.get(), export_ring_pool.get());
 
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
-    auto task_thread_pool = std::make_shared<SchedulerThreadPool<N1>>(tasker_num, parser_num, tree.get(), layer_queues.get());
+    auto task_thread_pool = std::make_shared<SchedulerThreadPool<N1>>(tasker_num, classifier_num + 1, tree.get(), layer_queues.get());
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤
-    auto parser_thread_pool = std::make_shared<ParserThreadPool<N1>>(k_len, tree.get(), pool.get(), ring_pool.get(), task_thread_pool.get(), parser_num);
+    auto parser_thread_pool = std::make_shared<ParserThreadPool<N1>>(k_len, tree.get(), pool.get(), reader_parser_ring_pool.get(), parser_classifier_ring_pool.get(), parser_num);
+    // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
+    auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<N1>>(k_len, tree.get(), parser_classifier_ring_pool.get(), task_thread_pool.get(), classifier_num);
 
     // 初始化导出写入器，用于将低频 k-mer 单线程安全落盘
     auto export_writer = std::make_shared<ExportWriter<N1>>(export_ring_pool.get());
@@ -149,9 +128,8 @@ int main(int argc, char *argv[])
     layer_queues->initialize_final_drain_queue(tree->root_nodes);
 
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
-    FastqReader<N1> reader(filename, k_len, FASTQ_FILE_CHUNK_SIZE, ring_pool.get());
-    FastqParser<N1> parser(k_len, ring_pool.get(), tree.get(), pool.get());
-    
+    FastqReader<N1> reader(filename, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
+    FastqClassifier<N1> classifier(k_len, parser_classifier_ring_pool.get(), tree.get());
 
     const auto init_end = std::chrono::steady_clock::now();
 
@@ -167,9 +145,8 @@ int main(int argc, char *argv[])
 
     const auto read_end = std::chrono::steady_clock::now();
 
-    parser.parse_and_push();
-    ring_pool->producer_finished(); // 显式标记 Parser 的生产者角色完成，通知 Tasker 和 Exporter 不再有新数据
-    parser_thread_pool->add_total_read_kmer(parser.get_total_read_kmer());
+    classifier.classify_and_push();
+    task_thread_pool->mark_producer_done(); // 显式标记 Classifier 的生产者角色完成，通知 Scheduler 不再有新数据
 
     // 阻塞等待 Parser 线程将所有文件块解析并生成 k-mer 完成
     parser_thread_pool->join();

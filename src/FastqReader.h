@@ -28,7 +28,7 @@ class FastqReader
 public:
     int k;
 
-    explicit FastqReader(const std::string &filename, const int in_k, uint64_t chunk_size, RingMemoryPool<RING_MEMORY_POOL_CAPACITY> *in_ring_memory_pool_ptr)
+    explicit FastqReader(const std::string &filename, const int in_k, uint64_t chunk_size, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_ring_memory_pool_ptr)
         : filename_(filename), ring_memory_pool_ptr_(in_ring_memory_pool_ptr), file_buffer_(chunk_size),
           k(in_k), chunk_size_(chunk_size)
     {
@@ -336,7 +336,7 @@ private:
     off_t have_read_ = 0;
     uint64_t chunk_size_;
     std::string filename_;
-    RingMemoryPool<RING_MEMORY_POOL_CAPACITY> *ring_memory_pool_ptr_;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *ring_memory_pool_ptr_;
     std::vector<char> file_buffer_; // 预留给读缓冲参数，保持接口兼容
     char left_buffer_[128];         // 块在碱基行中间截断时，保存最后(k-1)个碱基用于下块前缀
     size_t left_buffer_size_ = 0;   // left_buffer_中有效碱基字节数

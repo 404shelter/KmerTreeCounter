@@ -15,8 +15,9 @@
 #include <thread>
 #include <random>
 
+/*
 template <uint32_t N>
-class FastqParser final
+class FastqParser
 {
 
     //static constexpr uint64_t KMER_BATCH_CAPACITY = (KMER_BATCH_SIZE - sizeof(uint64_t) * 2) / sizeof(kmer<N>);
@@ -28,7 +29,7 @@ class FastqParser final
 
     const int k;
     uint64_t total_read_kmer = 0;
-    RingMemoryPool<RING_MEMORY_POOL_CAPACITY> *ring_memory_pool_ptr;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *ring_memory_pool_ptr;
     KmerTree<N> *tree_ptr;
     ConcurrentMemoryPool *memory_pool_;
     GetKmer<N> get_kmer;
@@ -44,7 +45,7 @@ class FastqParser final
 
 public:
     explicit FastqParser(const int in_k,
-                         RingMemoryPool<RING_MEMORY_POOL_CAPACITY> *in_ring_memory_pool_ptr,
+                         RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_ring_memory_pool_ptr,
                          KmerTree<N> *in_tree_ptr,
                          ConcurrentMemoryPool *in_memory_pool_ptr)
         : k(in_k),
@@ -145,10 +146,7 @@ private:
 
     void calculate_block_prefix_counts()
     {
-        /*for(uint64_t i=0;i<(1ULL << (2 * ROOT_BASES));++i)
-        {
-            root_counts[i].fetch_add(local_block_prefix_counts[i], std::memory_order_relaxed);
-        }*/
+
 
         local_block_prefix_sums[0] = 0;
         for (uint64_t i = 1; i < local_block_prefix_counts.size(); ++i)
@@ -177,7 +175,7 @@ private:
 
         uint64_t mask = -(seq_kmer < rev_kmer); // 无分支掩码
 
-        
+
 
         kmer<N> &canonical_kmer = kmer_buffer[kmer_buffer_count];
 
@@ -219,7 +217,7 @@ private:
         }
     }
 
-    inline void flush_block_to_tree() noexcept
+    void flush_block_to_tree() noexcept
     {
         RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> *export_pool = tree_ptr->get_export_ring_pool();
         uint64_t high_offset = 0;
@@ -288,6 +286,92 @@ private:
     {
         tree_ptr->flush_local_root_nodes(local_root_nodes, start_root_node_index);
     }
+};
+*/
+
+template <uint32_t N>
+class FastqParser
+{
+    // 自旋参数
+    static constexpr int YIELD_THRESHOLD = 128;
+    static constexpr int MAX_BACKOFF = 128;
+
+    int k_len;
+
+    uint64_t total_read_kmer = 0;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *reader_parser_ring_pool;
+    RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *parser_classifier_ring_pool;
+    KmerTree<N> *tree;
+
+public:
+    explicit FastqParser(uint32_t in_k_len, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool,
+                         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool, KmerTree<N> *in_tree)
+        : k_len(in_k_len), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), tree(in_tree)
+    {
+    }
+
+    void parse_and_push()
+    {
+        content_type reader_parser_content;
+        bool not_empty = true;
+
+        int backoff_iterations = 1;
+        int spin_count = 0;
+
+        while ((!reader_parser_ring_pool->producer_finished()) || not_empty)
+        {
+
+            not_empty = reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content);
+            if (not_empty)
+            {
+                parse(reader_parser_content.data, reader_parser_content.length);
+                parser_classifier_ring_pool->consumer_enqueue(reader_parser_content.data);
+                backoff_iterations = 1;
+                spin_count = 0;
+            }
+            else
+            {
+
+                if (spin_count < YIELD_THRESHOLD)
+                {
+                    // 执行 'backoff_iterations' 次暂停指令
+                    for (int i = 0; i < backoff_iterations; ++i)
+                    {
+                        cpu_relax();
+                    }
+                    // 指数增加退避时间，直到上限
+                    backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
+                    spin_count++;
+                }
+                else
+                {
+                    // 向操作系统让出：如果我们自旋太久，持锁线程
+                    // 可能已被抢占。让操作系统调度其他线程。
+                    std::this_thread::yield();
+                }
+            }
+        }
+        
+    }
+
+    uint64_t get_total_read_kmer() const noexcept
+    {
+        return total_read_kmer;
+    }
+
+private:
+
+    void parse(char const *data_ptr, const uint64_t length){
+        content_type parser_classifier_content;
+        parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+        // 获取 k-mer，把 k-mer写入到parser_classifier_content的data里面，length是k-mer的数量，data最大是64KB
+        // 解析出 k-mer 后，total_read_kmer += k-mer数量;
+        // 解析出 k-mer 后，写入 parser_classifier_content.data，并设置 parser_classifier_content.length
+        parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+        
+    }
+
+
 };
 
 #endif
