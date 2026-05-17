@@ -3,7 +3,6 @@
 
 #include "kmer.h"
 #include "HashFunction.h"
-#include "../include/xxh3.h"
 #include "ConcurrentMemoryPool.h"
 
 #include <array>
@@ -46,8 +45,8 @@ public:
         // XXH128_hash_t hash_res1 = XXH3_128bits_withSeed(&k_mer, sizeof(k_mer), SEED_A);
         // const uint64_t h1 = hash_res1.low64;
         // const uint64_t h2 = hash_res1.high64 | 1ULL;
-        const uint64_t h1=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_A);
-        const uint64_t h2=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_B) | 1ULL;
+        const uint64_t h1 = hash_func(k_mer, SEED_A);
+        const uint64_t h2 = hash_func(k_mer, SEED_B) | 1ULL;
         const uint64_t block1_idx = 2 * (h1 & mod);
         const uint64_t insert_num1 = calculate_insert_num(h1, h2);
         const uint64_t snapshot1 = filter_bins[block1_idx].load(std::memory_order_relaxed);
@@ -63,8 +62,8 @@ public:
         // XXH128_hash_t hash_res2 = XXH3_128bits_withSeed(&k_mer, sizeof(k_mer), SEED_B);
         // const uint64_t h3 = hash_res2.low64;
         // const uint64_t h4 = hash_res2.high64 | 1ULL;
-        const uint64_t h3=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_C);
-        const uint64_t h4=XXH3_64bits_withSeed(&k_mer, sizeof(k_mer), SEED_D) | 1ULL;
+        const uint64_t h3 = hash_func(k_mer, SEED_C);
+        const uint64_t h4 = hash_func(k_mer, SEED_D) | 1ULL;
         const uint64_t block2_idx = 2 * (h3 & mod) + 1;
         const uint64_t insert_num2 = calculate_insert_num(h3, h4);
         const uint64_t snapshot2 = filter_bins[block2_idx].load(std::memory_order_relaxed);
@@ -83,9 +82,8 @@ public:
 
     bool exist(const kmer<N> &k_mer) noexcept
     {
-        XXH128_hash_t hash_res1 = XXH3_128bits_withSeed(&k_mer, sizeof(k_mer), SEED_A);
-        const uint64_t h1 = hash_res1.low64;
-        const uint64_t h2 = hash_res1.high64 | 1ULL;
+        const uint64_t h1 = hash_func(k_mer, SEED_A);
+        const uint64_t h2 = hash_func(k_mer, SEED_B) | 1ULL;
         const uint64_t block1_idx = 2 * (h1 & mod);
         const uint64_t insert_num1 = calculate_insert_num(h1, h2);
         const uint64_t cur_bin1 = filter_bins[block1_idx].load(std::memory_order_relaxed);
@@ -94,9 +92,8 @@ public:
             return false; // kmer doesn't exist in the first filter
         }
 
-        XXH128_hash_t hash_res2 = XXH3_128bits_withSeed(&k_mer, sizeof(k_mer), SEED_B);
-        const uint64_t h3 = hash_res2.low64;
-        const uint64_t h4 = hash_res2.high64 | 1ULL;
+        const uint64_t h3 = hash_func(k_mer, SEED_C);
+        const uint64_t h4 = hash_func(k_mer, SEED_D) | 1ULL;
         const uint64_t block2_idx = 2 * (h3 & mod) + 1;
         const uint64_t insert_num2 = calculate_insert_num(h3, h4);
         const uint64_t cur_bin2 = filter_bins[block2_idx].load(std::memory_order_relaxed);

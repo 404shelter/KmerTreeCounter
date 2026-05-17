@@ -60,8 +60,7 @@ struct content_type
 };
 
 // 解析线程配置常量
-constexpr double TASK_CLASSIFIER_RATIO = 1;                  // 解析与任务线程比例
-//constexpr uint64_t PARSER_KMER_BUFFER_SIZE = 16ULL * 1024; // 解析线程内部 k-mer 缓冲区大小，单位为字节
+constexpr double TASK_CLASSIFIER_RATIO = 1;                  // 分类与任务线程比例
 
 // 任务线程配置常量
 constexpr uint32_t LOCAL_STACK_SIZE = 64;

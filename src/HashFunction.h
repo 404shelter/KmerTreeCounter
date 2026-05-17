@@ -7,9 +7,9 @@
 
 
 template <uint32_t N>
-inline uint64_t hash_func(const kmer<N> &key)
+inline uint64_t hash_func(const kmer<N> &key, const uint64_t seed = 0) noexcept
 {
-    uint64_t h = key.data[0];
+    uint64_t h = key.data[0] ^ seed;
     for (uint32_t i = 1; i < N; ++i)
     {
         h ^= key.data[i];
