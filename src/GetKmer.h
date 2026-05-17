@@ -41,6 +41,7 @@ public:
         else
         {
             back_mask = 0xffffffffffffffffULL;
+            rev_insert_shift = 0;
         }
         clear();
     }
