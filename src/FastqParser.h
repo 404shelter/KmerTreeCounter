@@ -303,10 +303,12 @@ class FastqParser
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *parser_classifier_ring_pool;
     KmerTree<N> *tree;
 
+    GetKmer<N> get_kmer;
+
 public:
     explicit FastqParser(uint32_t in_k_len, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool,
                          RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool, KmerTree<N> *in_tree)
-        : k_len(in_k_len), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), tree(in_tree)
+        : k_len(in_k_len), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), tree(in_tree), get_kmer(in_k_len)
     {
     }
 
@@ -325,7 +327,7 @@ public:
             if (not_empty)
             {
                 parse(reader_parser_content.data, reader_parser_content.length);
-                parser_classifier_ring_pool->consumer_enqueue(reader_parser_content.data);
+                reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
                 backoff_iterations = 1;
                 spin_count = 0;
             }
@@ -351,7 +353,6 @@ public:
                 }
             }
         }
-        
     }
 
     uint64_t get_total_read_kmer() const noexcept
@@ -360,18 +361,40 @@ public:
     }
 
 private:
-
-    void parse(char const *data_ptr, const uint64_t length){
+    void parse(char const *data_ptr, const uint64_t length)
+    {
         content_type parser_classifier_content;
         parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+        uint64_t content_kmer_count = 0;
         // 获取 k-mer，把 k-mer写入到parser_classifier_content的data里面，length是k-mer的数量，data最大是64KB
         // 解析出 k-mer 后，total_read_kmer += k-mer数量;
         // 解析出 k-mer 后，写入 parser_classifier_content.data，并设置 parser_classifier_content.length
-        parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
-        
+        kmer<N> *kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
+        for (int i = 0; i < length; ++i)
+        {
+            const char c = data_ptr[i];
+            if (get_kmer.get_next_one(c))
+            {
+                kmer_buffer[content_kmer_count++] = get_kmer.canonical_kmer;
+                if (content_kmer_count >= (PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>))) [[unlikely]]
+                {
+                    parser_classifier_content.length = content_kmer_count;
+                    parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+                    total_read_kmer += content_kmer_count;
+                    content_kmer_count = 0;
+                    parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+                    kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
+                }
+            }
+        }
+        if (content_kmer_count > 0)
+        {
+            parser_classifier_content.length = content_kmer_count;
+            parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+            total_read_kmer += content_kmer_count;
+        }
+        get_kmer.clear();
     }
-
-
 };
 
 #endif

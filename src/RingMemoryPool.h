@@ -58,7 +58,7 @@ public:
 
     inline bool producer_finished() const noexcept
     {
-        return active_producers_.load(std::memory_order_relaxed) == 0;
+        return active_producers_.load(std::memory_order_relaxed) <= 0;
     }
 
     // Producer pushes processed data for consumer.
@@ -133,7 +133,7 @@ private:
     std::vector<char> memory_pool_;
     alignas(CACHE_LINE_SIZE) MPMCRingQueue<content_type, CAPACITY> producer_to_consumer_;
     alignas(CACHE_LINE_SIZE) MPMCRingQueue<char*, CAPACITY> consumer_to_producer_;
-    alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> active_producers_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<int> active_producers_{0};
 };
 
 #endif // RING_MEMORY_POOL_HEADER

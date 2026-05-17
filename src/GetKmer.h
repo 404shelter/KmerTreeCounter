@@ -12,6 +12,7 @@ class GetKmer
 public:
     kmer<N> seq_kmer;
     kmer<N> rev_kmer;
+    kmer<N> canonical_kmer;
 
     uint64_t rev_insert_shift; // 反向 k-mer 插入时需要左移的位数
 
@@ -72,10 +73,12 @@ public:
 
         rev_kmer.data[N - 1] |= (base_2bit ^ 0b11) << rev_insert_shift;
 
+        canonicalize();
+
         return have_read >= k;
     }
 
-    void canonicalize(kmer<N> &canonical_kmer) noexcept
+    void canonicalize() noexcept
     {
         uint64_t mask = -(seq_kmer < rev_kmer); // 无分支掩码
 

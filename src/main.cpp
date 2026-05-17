@@ -91,11 +91,12 @@ int main(int argc, char *argv[])
     // Worker 预算去除了主线程(Reader)和导出线程(ExportWriter)
     const uint32_t worker_budget = n_thread - 4;
     const uint32_t parser_num = 2;
-    const uint32_t classifier_num = worker_budget / (1.0 + TASK_CLASSIFIER_RATIO);
+    const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : (uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO));
     const uint32_t tasker_num = worker_budget - classifier_num;
 
     std::cout << "Thread split:" << std::endl;
     std::cout << "  parser threads: " << parser_num << std::endl;
+    std::cout << "  classifier threads: " << classifier_num << std::endl;
     std::cout << "  task threads: " << tasker_num << std::endl;
 
     const auto init_start = std::chrono::steady_clock::now();
@@ -137,11 +138,14 @@ int main(int argc, char *argv[])
 
     // 启动多线程流水线的各个工作线程
     parser_thread_pool->start();
+    classifier_thread_pool->start();
     task_thread_pool->start();
     export_writer->start();
 
     // 在主线程中运行读取器，读取文件块并推送给 Parser
     reader.read();
+
+    reader_parser_ring_pool->producer_set_finished(); // 显式标记 Reader 的生产者角色完成，通知 Parser 不再有新数据
 
     const auto read_end = std::chrono::steady_clock::now();
 
@@ -150,6 +154,7 @@ int main(int argc, char *argv[])
 
     // 阻塞等待 Parser 线程将所有文件块解析并生成 k-mer 完成
     parser_thread_pool->join();
+    classifier_thread_pool->join();
     const auto parser_end = std::chrono::steady_clock::now();
     // 阻塞等待 Tasker 线程消费完所有的分发任务
     task_thread_pool->join();
