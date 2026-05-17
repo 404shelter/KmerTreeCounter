@@ -17,6 +17,7 @@
 #include <vector>
 #include <utility>
 #include <chrono>
+#include <bitset>
 
 template <uint32_t N>
 class ClassifierThreadPool
@@ -28,6 +29,7 @@ class ClassifierThreadPool
     SchedulerThreadPool<N> *task_thread_pool;
     KmerTree<N> *tree;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
+
 
 public:
     explicit ClassifierThreadPool(const int in_k, KmerTree<N> *tree_ptr,

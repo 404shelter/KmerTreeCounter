@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cstdint>
+#include <bitset>
 
 template <uint32_t N>
 class FastqClassifier
@@ -27,10 +28,12 @@ class FastqClassifier
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> local_block_prefix_counts{};
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> local_block_prefix_sums{};
     std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_for_copy{};
+    std::bitset<PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_export_bitmap{};
 
 public:
     explicit FastqClassifier(uint32_t in_k_len, RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_ring_pool, KmerTree<N> *in_tree)
-        : k_len(in_k_len), parser_classifier_ring_pool(in_ring_pool), tree(in_tree)
+        : k_len(in_k_len),
+          parser_classifier_ring_pool(in_ring_pool), tree(in_tree)
     {
     }
 
@@ -84,7 +87,7 @@ private:
     {
         calculate_block_prefix_counts(kmer_data, kmer_count);
         push_kmers_into_local_block_for_copy(kmer_data, kmer_count);
-        classify_local_block();
+        classify_local_block(kmer_count);
     }
 
     void calculate_block_prefix_counts(kmer<N> *kmer_data, const uint64_t kmer_count)
@@ -117,7 +120,7 @@ private:
         }
     }
 
-    void classify_local_block() noexcept
+    void classify_local_block(const uint64_t kmer_count) noexcept
     {
         RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> *export_pool = tree->get_export_ring_pool();
 
@@ -126,6 +129,8 @@ private:
         ExportBlock<N> *export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
         uint64_t export_kmer_count = 0;
         uint64_t local_block_count = 0;
+
+        local_block_export_bitmap.reset();
 
         uint64_t read_offset = 0;
         for (uint64_t prefix = 0; prefix < local_block_prefix_counts.size(); ++prefix)
@@ -141,8 +146,8 @@ private:
 
             for (uint32_t i = 0; i < prefix_count; ++i)
             {
-                const kmer<N> &val = local_block_for_copy[read_offset++];
-                if (bloom_filter->insert(val))
+                const kmer<N> &val = local_block_for_copy[read_offset];
+                /*if (bloom_filter->insert(val))
                 {
                    export_block_ptr->k_mers[export_kmer_count++] = val;
                 }
@@ -151,13 +156,31 @@ private:
                     local_block_for_copy[local_block_count] = val;
                     local_block_count++;
                     local_block_prefix_counts[prefix]++;
+                }*/
+                if (bloom_filter->insert(val))
+                {
+                    local_block_export_bitmap.set(read_offset);
                 }
+
+                read_offset++;
+            }
+        }
+
+        for (uint64_t i = 0; i < kmer_count; ++i)
+        {
+            if (local_block_export_bitmap.test(i))
+            {
+                export_block_ptr->k_mers[export_kmer_count++] = local_block_for_copy[i];
+            }
+            else
+            {
+                local_block_for_copy[local_block_count++] = local_block_for_copy[i];
             }
         }
 
         export_pool->producer_enqueue({raw_block_ptr, export_kmer_count});
 
-        if (local_block_count > 0)[[likely]]
+        if (local_block_count > 0) [[likely]]
         {
             tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, local_root_nodes.data());
         }
