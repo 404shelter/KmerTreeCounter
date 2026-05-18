@@ -14,6 +14,7 @@
 #include <memory>
 #include <thread>
 #include <random>
+#include <immintrin.h>
 
 /*
 template <uint32_t N>
@@ -319,17 +320,18 @@ public:
 
         int backoff_iterations = 1;
         int spin_count = 0;
-
-        while ((!reader_parser_ring_pool->producer_finished()) || not_empty)
+        //当队列确实为空且生产者已结束时才退出循环
+         while (true)
         {
-
-            not_empty = reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content);
-            if (not_empty)
+            if (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
             {
                 parse(reader_parser_content.data, reader_parser_content.length);
                 reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
                 backoff_iterations = 1;
                 spin_count = 0;
+            }else if (reader_parser_ring_pool->producer_finished())
+            {
+                break;
             }
             else
             {
@@ -361,6 +363,7 @@ public:
     }
 
 private:
+
     void parse(char const *data_ptr, const uint64_t length)
     {
         content_type parser_classifier_content;
@@ -370,23 +373,103 @@ private:
         // 解析出 k-mer 后，total_read_kmer += k-mer数量;
         // 解析出 k-mer 后，写入 parser_classifier_content.data，并设置 parser_classifier_content.length
         kmer<N> *kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
-        for (int i = 0; i < length; ++i)
-        {
-            const char c = data_ptr[i];
-            if (get_kmer.get_next_one(c))
-            {
-                kmer_buffer[content_kmer_count++] = get_kmer.canonical_kmer;
-                if (content_kmer_count >= (PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>))) [[unlikely]]
-                {
-                    parser_classifier_content.length = content_kmer_count;
-                    parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
-                    total_read_kmer += content_kmer_count;
-                    content_kmer_count = 0;
-                    parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
-                    kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
+        // for (int i = 0; i < length; ++i)
+        // {
+        //     const char c = data_ptr[i];
+        //     if (get_kmer.get_next_one(c))
+        //     {
+        //         kmer_buffer[content_kmer_count++] = get_kmer.canonical_kmer;
+        //         if (content_kmer_count >= (PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>))) [[unlikely]]
+        //         {
+        //             parser_classifier_content.length = content_kmer_count;
+        //             parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+        //             total_read_kmer += content_kmer_count;
+        //             content_kmer_count = 0;
+        //             parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+        //             kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
+        //         }
+        //     }
+        // }
+
+        //一次处理32字节
+        const __m256i NL = _mm256_set1_epi8('\n');
+        const __m256i MASK_UPPER = _mm256_set1_epi8(0xDF);
+        const __m256i A = _mm256_set1_epi8('A');
+        const __m256i C = _mm256_set1_epi8('C');
+        const __m256i G = _mm256_set1_epi8('G');
+        const __m256i T = _mm256_set1_epi8('T');
+
+        const char* ptr = data_ptr;
+        const char* end = data_ptr + length;
+
+        while (ptr < end) {
+            size_t chunk = std::min<size_t>(end - ptr, 32);
+            __m256i input = _mm256_loadu_si256((__m256i*)ptr);
+
+            __m256i nl_mask = _mm256_cmpeq_epi8(input, NL);
+            uint32_t nl_bits = _mm256_movemask_epi8(nl_mask) & ((1ULL << chunk) - 1);
+
+            __m256i upper = _mm256_and_si256(input, MASK_UPPER);
+            __m256i base_mask = _mm256_or_si256(
+                _mm256_or_si256(_mm256_cmpeq_epi8(upper, A), _mm256_cmpeq_epi8(upper, C)),
+                _mm256_or_si256(_mm256_cmpeq_epi8(upper, G), _mm256_cmpeq_epi8(upper, T))
+            );
+            uint32_t base_bits = _mm256_movemask_epi8(base_mask) & ((1ULL << chunk) - 1);
+
+            uint32_t all_valid_bits = nl_bits | base_bits;
+            uint32_t invalid_bits = (~all_valid_bits) & ((1ULL << chunk) - 1);
+
+            // 合并所有位（有效位 + 无效位），遍历处理
+            uint32_t bits = all_valid_bits | invalid_bits;
+            while (bits) {
+                int idx = __builtin_ctz(bits);
+                uint32_t bit = 1u << idx;
+
+                if (base_bits & bit) {
+                    // 找到一段连续碱基运行；计算其长度
+                    uint32_t run_bits = base_bits >> idx;
+                    int run_len = 1;
+                    // 限定最长 16 个碱基
+                    while ((idx + run_len < 32) && (run_len < 16) && (run_bits & (1u << run_len))) {
+                        ++run_len;
+                    }
+
+                    // 将此运行中的所有碱基编码打包为一个 uint32_t
+                    // (ch & 0x06) >> 1
+                    uint32_t packed = 0;
+                    for (int i = 0; i < run_len; ++i) {
+                        uint8_t byte_val = static_cast<uint8_t>(ptr[idx + i]);
+                        packed = (packed << 2) | ((byte_val & 0x06) >> 1);
+                    }
+
+                    // 批次插入前确保缓冲区有足够空间（一次最多写入 run_len 个 k-mer）
+                    constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
+                    if (content_kmer_count + static_cast<uint64_t>(run_len) > KMER_BUF_CAP) [[unlikely]] {
+                        parser_classifier_content.length = content_kmer_count;
+                        parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+                        total_read_kmer += content_kmer_count;
+                        content_kmer_count = 0;
+                        parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+                        kmer_buffer = reinterpret_cast<kmer<N>*>(parser_classifier_content.data);
+                    }
+
+                    // 批次插入：一次更新 k-mer 状态，同时拿到新完成的 k-mer
+                    uint32_t new_kmers = get_kmer.batch_insert(packed, run_len,
+                        &kmer_buffer[content_kmer_count]);
+                    content_kmer_count += new_kmers;
+
+                    // 清除已处理的位
+                    uint32_t clear_mask = ((1u << run_len) - 1) << idx;
+                    bits &= ~clear_mask;
+                } else {
+                    // 遇到无效字符或换行符，清空 k-mer 状态
+                    get_kmer.clear();
+                    bits &= bits - 1;
                 }
             }
+            ptr += chunk;
         }
+
         if (content_kmer_count > 0)
         {
             parser_classifier_content.length = content_kmer_count;
