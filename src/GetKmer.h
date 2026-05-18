@@ -32,6 +32,8 @@ public:
         char_to_2bit['g'] = 2;
         char_to_2bit['T'] = 3;
         char_to_2bit['t'] = 3;
+        char_to_2bit['U'] = 3;
+        char_to_2bit['u'] = 3;
 
         if (remainder != 0ULL)
         {
@@ -110,7 +112,7 @@ public:
         {
             uint64_t comp = 0;
             for (uint32_t kk = 0; kk < count; ++kk) {
-                uint64_t g = (packed_codes >> (2 * kk)) & 0x3ULL;     // 从 LSB 取
+                uint64_t g = (packed_codes >> (2 * (count - 1 - kk))) & 0x3ULL;
                 comp = (comp << 2) | (g ^ 0b11ULL);
             }
             rev_kmer.data[N - 1] |= (comp << rev_insert_shift);
@@ -146,29 +148,6 @@ public:
         }
         return out_cnt;
     }
-
-    bool get_next_code(const uint8_t code)
-    {
-        if (code > 3)
-        {
-            clear();
-            return false;
-        }
-
-        have_read++;
-        const uint64_t base_2bit = static_cast<uint64_t>(code);
-
-        seq_kmer.template shift_right_static<1>();
-        seq_kmer.data[0] |= (base_2bit << (BASES_PER_U64T * 2 - 2));
-        seq_kmer.data[N - 1] &= back_mask;
-
-        rev_kmer.template shift_left_static<1>();
-
-        rev_kmer.data[N - 1] |= (base_2bit ^ 0b11) << rev_insert_shift;
-
-        return have_read >= k;
-    }
-
 
     void canonicalize() noexcept
     {
