@@ -179,6 +179,7 @@ int main(int argc, char *argv[])
     const auto final_end = std::chrono::steady_clock::now();
 
     const auto init_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(init_end - init_start).count();
+    const auto read_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(read_end - mid_start).count();
     const auto mid_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(mid_end - mid_start).count();
     const auto final_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - final_start).count();
     const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - init_start).count();
@@ -186,6 +187,7 @@ int main(int argc, char *argv[])
     const auto read_parse_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(parser_end - read_end).count();
 
     std::cout << "Init elapsed us: " << init_elapsed_us << std::endl;
+    std::cout << "Read elapsed us: " << read_elapsed_us << std::endl;
     std::cout << "Mid elapsed us: " << mid_elapsed_us << std::endl;
     std::cout << "Between Read and Parse elapsed us: " << read_parse_elapsed_us << std::endl;
     std::cout << "Between Parse and Task elapsed us: " << parse_task_elapsed_us << std::endl;
