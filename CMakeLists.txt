@@ -20,8 +20,7 @@ file(GLOB_RECURSE SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
 )
-add_compile_options(-mavx2) 
-add_compile_options(-mavx512f)
+
 add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_link_libraries(${PROJECT_NAME} aio)
