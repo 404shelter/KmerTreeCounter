@@ -32,6 +32,8 @@ public:
         char_to_2bit['g'] = 2;
         char_to_2bit['T'] = 3;
         char_to_2bit['t'] = 3;
+        char_to_2bit['U'] = 3;
+        char_to_2bit['u'] = 3;
 
         if (remainder != 0ULL)
         {
@@ -77,6 +79,74 @@ public:
         canonicalize();
 
         return have_read >= k;
+    }
+
+    // 批量插入 count 个连续碱基
+    uint32_t batch_insert(uint32_t packed_codes, uint32_t count, kmer<N>* output) noexcept
+    {
+        uint32_t old_have = have_read;
+        uint32_t out_cnt = 0;
+
+        // 保存批处理前的状态
+        kmer<N> seq_work = seq_kmer;
+        kmer<N> rev_work = rev_kmer;
+
+        have_read += count;
+
+        seq_kmer.shift_right(count);
+        {
+            // 反转 packed_codes，使最新碱基到最高位
+            uint64_t reversed = 0;
+            for (uint32_t kk = 0; kk < count; ++kk) {
+                uint64_t c = (packed_codes >> (2 * kk)) & 0x3ULL;
+                reversed = (reversed << 2) | c;
+            }
+            seq_kmer.data[0] |= (reversed << (BASES_PER_U64T * 2 - 2 * count));
+        }
+        if (remainder != 0) {
+            seq_kmer.data[N - 1] &= back_mask;
+        }
+
+        // 更新 rev_kmer
+        rev_kmer.shift_left(count);
+        {
+            uint64_t comp = 0;
+            for (uint32_t kk = 0; kk < count; ++kk) {
+                uint64_t g = (packed_codes >> (2 * (count - 1 - kk))) & 0x3ULL;
+                comp = (comp << 2) | (g ^ 0b11ULL);
+            }
+            rev_kmer.data[N - 1] |= (comp << rev_insert_shift);
+        }
+
+        // 从工作副本生成中间 k‑mer
+        for (uint32_t kk = 0; kk < count; ++kk) {
+            uint64_t code = (packed_codes >> (2 * (count - 1 - kk))) & 0x3ULL;  // 从旧到新
+
+            // 单碱基插入工作副本
+            seq_work.shift_right(1);
+            seq_work.data[0] |= (code << (BASES_PER_U64T * 2 - 2));
+            if (remainder != 0) seq_work.data[N - 1] &= back_mask;
+
+            rev_work.shift_left(1);
+            rev_work.data[N - 1] |= ((code ^ 0b11ULL) << rev_insert_shift);
+
+            if (++old_have >= k) {
+                uint64_t mask_n = -(seq_work < rev_work);
+                kmer<N>& out = output[out_cnt];
+                if constexpr (N == 1) {
+                    out.data[0] = (seq_work.data[0] & mask_n) | (rev_work.data[0] & (~mask_n));
+                } else if constexpr (N == 2) {
+                    out.data[0] = (seq_work.data[0] & mask_n) | (rev_work.data[0] & (~mask_n));
+                    out.data[1] = (seq_work.data[1] & mask_n) | (rev_work.data[1] & (~mask_n));
+                } 
+                else {
+                    for (uint32_t j = 0; j < N; ++j)
+                        out.data[j] = (seq_work.data[j] & mask_n) | (rev_work.data[j] & (~mask_n));
+                }
+                out_cnt++;
+            }
+        }
+        return out_cnt;
     }
 
     void canonicalize() noexcept

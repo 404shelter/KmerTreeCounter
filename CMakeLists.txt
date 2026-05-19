@@ -20,6 +20,8 @@ file(GLOB_RECURSE SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
 )
+add_compile_options(-mavx2) 
+add_compile_options(-mavx512f)
 add_executable(${PROJECT_NAME} ${SOURCES})
 
 target_link_libraries(${PROJECT_NAME} aio)
@@ -34,4 +36,5 @@ add_test(NAME ConcurrentCountingHashMapTest COMMAND concurrent_counting_hash_map
 add_executable(concurrent_double_bloom_filter_test tests/test_bloom_filter.cpp)
 target_link_libraries(concurrent_double_bloom_filter_test pthread)
 target_link_libraries(concurrent_double_bloom_filter_test numa)
+
 
