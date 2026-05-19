@@ -312,12 +312,6 @@ public:
                          RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool, KmerTree<N> *in_tree)
         : k_len(in_k_len), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), tree(in_tree), get_kmer(in_k_len)
     {
-        for (int i = 0; i < 32; ++i) char_to_2bit[i] = 0;
-        char_to_2bit['A' % 26] = 0; char_to_2bit['a' % 26] = 0;
-        char_to_2bit['C' % 26] = 1; char_to_2bit['c' % 26] = 1;
-        char_to_2bit['G' % 26] = 2; char_to_2bit['g' % 26] = 2;
-        char_to_2bit['T' % 26] = 3; char_to_2bit['t' % 26] = 3;
-        char_to_2bit['U' % 26] = 3; char_to_2bit['u' % 26] = 3;
     }
 
     void parse_and_push()
@@ -358,6 +352,8 @@ public:
                 {
                     // 向操作系统让出：如果我们自旋太久，持锁线程
                     // 可能已被抢占。让操作系统调度其他线程。
+                    backoff_iterations = 1;
+                    spin_count = 0;
                     std::this_thread::yield();
                 }
             }
@@ -370,19 +366,16 @@ public:
     }
 
 private:
-    alignas(32) inline static uint8_t char_to_2bit[32];
-
     #if defined(__AVX2__)
-        const __m256i NL = _mm256_set1_epi8('\n');
         const __m256i MASK_UPPER = _mm256_set1_epi8(0xDF);
         const __m256i A = _mm256_set1_epi8('A');
         const __m256i C = _mm256_set1_epi8('C');
         const __m256i G = _mm256_set1_epi8('G');
         const __m256i T = _mm256_set1_epi8('T');
         const __m256i U = _mm256_set1_epi8('U');
+        
+        
     #elif defined(__SSE4_2__)
-        // 一次处理16字节
-        const __m128i NL = _mm_set1_epi8('\n');
         const __m128i MASK_UPPER = _mm_set1_epi8(0xDF);
         const __m128i A = _mm_set1_epi8('A');
         const __m128i C = _mm_set1_epi8('C');
@@ -406,22 +399,35 @@ private:
         // 一次处理32字节
         const char* ptr = data_ptr;
         const char* end = data_ptr + length;
+        alignas(32) uint8_t codes[32];
 
         while (ptr < end) {
             size_t chunk = std::min<size_t>(end - ptr, 32);
             __m256i input = _mm256_loadu_si256((__m256i*)ptr);
 
-            __m256i nl_mask = _mm256_cmpeq_epi8(input, NL);
-            uint32_t nl_bits = _mm256_movemask_epi8(nl_mask) & ((1ULL << chunk) - 1);
-
             __m256i upper = _mm256_and_si256(input, MASK_UPPER);
+            __m256i uA = _mm256_cmpeq_epi8(upper, A);
+            __m256i uC = _mm256_cmpeq_epi8(upper, C);
+            __m256i uG = _mm256_cmpeq_epi8(upper, G);
+            __m256i uTU = _mm256_or_si256(_mm256_cmpeq_epi8(upper, T), _mm256_cmpeq_epi8(upper, U));
+
+            __m256i bit0_mask = _mm256_or_si256(uC, uTU);
+            __m256i bit1_mask = _mm256_or_si256(uG, uTU);
+            
+            __m256i bit0 = _mm256_and_si256(bit0_mask, _mm256_set1_epi8(1));
+            __m256i bit1 = _mm256_and_si256(bit1_mask, _mm256_set1_epi8(2));
+            __m256i encode = _mm256_or_si256(bit1, bit0);
+        
+            _mm256_store_si256((__m256i*)codes, encode);
+
             __m256i base_mask = _mm256_or_si256(
-                _mm256_or_si256(_mm256_cmpeq_epi8(upper, A), _mm256_cmpeq_epi8(upper, C)),
-                _mm256_or_si256(_mm256_cmpeq_epi8(upper, G), _mm256_or_si256(_mm256_cmpeq_epi8(upper, T), _mm256_cmpeq_epi8(upper, U)))
+                _mm256_or_si256(uA, uC),
+                bit1_mask
             );
+
             uint32_t base_bits = _mm256_movemask_epi8(base_mask) & ((1ULL << chunk) - 1);
 
-            uint32_t all_valid_bits = nl_bits | base_bits;
+            uint32_t all_valid_bits = base_bits;
             uint32_t invalid_bits = (~all_valid_bits) & ((1ULL << chunk) - 1);
 
             // 合并所有位（有效位 + 无效位），遍历处理
@@ -443,7 +449,7 @@ private:
                     uint32_t packed = 0;
                     for (int i = 0; i < run_len; ++i) {
                         uint8_t byte_val = static_cast<uint8_t>(ptr[idx + i]);
-                        packed = (packed << 2) | char_to_2bit[byte_val % 26];
+                        packed = (packed << 2) | codes[idx + i];
                     }
 
                     // 批次插入前确保缓冲区有足够空间（一次最多写入 run_len 个 k-mer）
@@ -477,24 +483,32 @@ private:
         // 一次处理16字节
         const char* ptr = data_ptr;
         const char* end = data_ptr + length;
+        alignas(16) uint8_t codes[16];
 
         while (ptr < end) {
-            size_t chunk = std::min<size_t>(end - ptr, 16);
-            __m128i input = _mm_loadu_si128((__m128i*)ptr);
+             size_t chunk = std::min<size_t>(end - ptr, 16);
+         __m128i input = _mm_loadu_si128((__m128i*)ptr);
 
-            __m128i nl_mask = _mm_cmpeq_epi8(input, NL);
-            uint16_t nl_bits = static_cast<uint16_t>(_mm_movemask_epi8(nl_mask) & ((1u << chunk) - 1));
+             __m128i upper = _mm_and_si128(input, MASK_UPPER);
+            __m128i uA = _mm_cmpeq_epi8(upper, A);
+            __m128i uC = _mm_cmpeq_epi8(upper, C);
+            __m128i uG = _mm_cmpeq_epi8(upper, G);
+            __m128i uTU = _mm_or_si128(_mm_cmpeq_epi8(upper, T), _mm_cmpeq_epi8(upper, U));
 
-            __m128i upper = _mm_and_si128(input, MASK_UPPER);
-            __m128i bm = _mm_or_si128(
-                _mm_or_si128(_mm_cmpeq_epi8(upper, A), _mm_cmpeq_epi8(upper, C)),
-                _mm_or_si128(_mm_cmpeq_epi8(upper, G), _mm_or_si128(_mm_cmpeq_epi8(upper, T), _mm_cmpeq_epi8(upper, U)))
-            );
-            uint16_t base_bits = static_cast<uint16_t>(_mm_movemask_epi8(bm) & ((1u << chunk) - 1));
+            __m128i bit0_mask = _mm_or_si128(uC, uTU);            
+            __m128i bit1_mask = _mm_or_si128(uG, uTU);           
+            __m128i bit0 = _mm_and_si128(bit0_mask, _mm_set1_epi8(1));
+            __m128i bit1 = _mm_and_si128(bit1_mask, _mm_set1_epi8(2));
+            __m128i encode = _mm_or_si128(bit1, bit0);            
 
-            uint16_t all_valid = nl_bits | base_bits;
+            __m128i base_mask = _mm_or_si128(_mm_or_si128(uA, uC), bit1_mask);
+            uint16_t base_bits = static_cast<uint16_t>(_mm_movemask_epi8(base_mask) & ((1u << chunk) - 1));
+            
+            _mm_store_si128((__m128i*)codes, encode);
+
+            // 合并有效位与无效位
+            uint16_t all_valid = base_bits;
             uint16_t invalid = static_cast<uint16_t>((~all_valid) & ((1u << chunk) - 1));
-
             uint16_t bits = all_valid | invalid;
             while (bits) {
                 int idx = __builtin_ctz(bits);
@@ -507,11 +521,10 @@ private:
                         ++run_len;
                     }
 
-                    // 查表 A→00, C→01, G→10, T/U→11
                     uint32_t packed = 0;
                     for (int i = 0; i < run_len; ++i) {
                         uint8_t byte_val = static_cast<uint8_t>(ptr[idx + i]);
-                        packed = (packed << 2) | CHAR_TO_CODE[byte_val % 26];
+                        packed = (packed << 2) | codes[idx + i];
                     }
 
                     constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
