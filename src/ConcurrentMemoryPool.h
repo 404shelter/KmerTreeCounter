@@ -840,26 +840,32 @@ inline void *ConcurrentMemoryPool::allocate()
 
     ThreadLocalCache &tls = tls_cache_;
 
+    FreeBlock *head, *tail;
+    size_t fetched = 0;
+
     // 初始化 TLS（首次访问）
     if (!tls.pool) [[unlikely]]
     {
         tls.pool = this;
         tls.local_arena_index = get_thread_arena_index();
         tls.local_arena = &arenas_[tls.local_arena_index];
+        fetched = batch_allocate_from_arena(*tls.local_arena, &head, &tail, TLS_CAPACITY);
     }
-
-    // 1. 尝试从本地空闲栈分配
-    if (tls.local_free_stack)
+    else
     {
-        FreeBlock *block = tls.local_free_stack;
-        tls.local_free_stack = block->next;
-        tls.local_free_count--;
-        return block;
+        // 1. 尝试从本地空闲栈分配
+        if (tls.local_free_stack) [[likely]]
+        {
+            FreeBlock *block = tls.local_free_stack;
+            tls.local_free_stack = block->next;
+            tls.local_free_count--;
+            return block;
+        }
+        fetched = batch_allocate_from_arena(*tls.local_arena, &head, &tail, BATCH_SIZE);
     }
 
     // 2. 本地栈为空，从本地 Arena 批量获取
-    FreeBlock *head, *tail;
-    size_t fetched = batch_allocate_from_arena(*tls.local_arena, &head, &tail, BATCH_SIZE);
+
     if (fetched > 0)
     {
         // 第一个块立即返回

@@ -269,7 +269,6 @@ public:
 
         // 再次检查是否有其他线程已经插入了这个键
         head_node = bucket.head.load(std::memory_order_acquire);
-        uint64_t cur_size_ = size_.load(std::memory_order_relaxed);
 
         if (head_node == nullptr)
         {
@@ -279,7 +278,7 @@ public:
 
             new_node->insert(key, ctrl_value, increment_value);
             bucket.head.store(new_node, std::memory_order_release);
-            size_.store(cur_size_ + 1, std::memory_order_relaxed);
+            size_.fetch_add(1, std::memory_order_relaxed);
             return;
         }
         node = (node == nullptr) ? head_node : node; // 如果之前没有遍历过链表，先从头节点开始
@@ -309,7 +308,7 @@ public:
             new_node->insert(key, ctrl_value, increment_value);
             node->next.store(new_node, std::memory_order_release);
         }
-        size_.store(cur_size_ + 1, std::memory_order_relaxed);
+        size_.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
