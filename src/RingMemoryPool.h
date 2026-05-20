@@ -95,9 +95,9 @@ public:
     }
 
     // Consumer returns used block for producer reuse.
-    void consumer_try_enqueue(char *block_ptr)
+    bool consumer_try_enqueue(char *block_ptr)
     {
-        consumer_to_producer_.try_enqueue(block_ptr);
+        return consumer_to_producer_.try_enqueue(block_ptr);
     }
 
     void consumer_enqueue(char *block_ptr)

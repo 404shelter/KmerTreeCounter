@@ -32,6 +32,11 @@ class ParserThreadPool
     std::atomic<uint64_t> total_read_kmer = 0;
 
 public:
+#ifdef TEST_MODE
+    std::atomic<uint64_t> total_in_spin_time{0};
+    std::atomic<uint64_t> total_out_spin_time{0};
+#endif
+
     explicit ParserThreadPool(const int in_k, KmerTree<N> *tree_ptr,
                               ConcurrentMemoryPool *pool_ptr,
                               RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool_ptr,
@@ -53,10 +58,16 @@ public:
         {
             threads_ptr.push_back(std::make_unique<std::thread>([&]
                                                                 {
-				FastqParser<N> parser(k, reader_parser_ring_pool, parser_classifier_ring_pool, tree);
-				parser.parse_and_push();
-				total_read_kmer += parser.get_total_read_kmer();
-                parser_classifier_ring_pool->producer_set_finished(); }));
+                                                                    FastqParser<N> parser(k, reader_parser_ring_pool, parser_classifier_ring_pool, tree);
+                                                                    parser.parse_and_push();
+                                                                    total_read_kmer += parser.get_total_read_kmer();
+                                                                    parser_classifier_ring_pool->producer_set_finished();
+
+#ifdef TEST_MODE
+                                                                    total_in_spin_time += parser.in_spin_time;
+                                                                    total_out_spin_time += parser.out_spin_time;
+#endif
+                                                                }));
         }
     }
 
@@ -80,7 +91,6 @@ public:
     {
         total_read_kmer.fetch_add(count, std::memory_order_acq_rel);
     }
-
 };
 
 #endif // PARSER_THREAD_POOL_HEADER

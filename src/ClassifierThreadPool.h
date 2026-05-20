@@ -30,8 +30,12 @@ class ClassifierThreadPool
     KmerTree<N> *tree;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
 
-
 public:
+#ifdef TEST_MODE
+    std::atomic<uint64_t> total_in_spin_time{0};
+    std::atomic<uint64_t> total_out_spin_time{0};
+#endif
+
     explicit ClassifierThreadPool(const int in_k, KmerTree<N> *tree_ptr,
                                   RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool_ptr,
                                   SchedulerThreadPool<N> *task_thread_pool_ptr,
@@ -51,9 +55,14 @@ public:
         {
             threads_ptr.push_back(std::make_unique<std::thread>([&]
                                                                 {
-				FastqClassifier<N> parser(k_len, parser_classifier_ring_pool, tree);
-				parser.classify_and_push();
-                task_thread_pool->mark_producer_done(); }));
+                                                                    FastqClassifier<N> parser(k_len, parser_classifier_ring_pool, tree);
+                                                                    parser.classify_and_push();
+                                                                    task_thread_pool->mark_producer_done();
+#ifdef TEST_MODE
+                                                                    total_in_spin_time += parser.in_spin_time;
+                                                                    total_out_spin_time += parser.out_spin_time;
+#endif
+                                                                }));
         }
     }
 
@@ -66,8 +75,8 @@ public:
                 t->join();
             }
         }
-    }
 
+    }
 };
 
 #endif
