@@ -18,6 +18,7 @@
 #include <utility>
 #include <iostream>
 #include <cstdlib>
+#include <aio.h>
 
 template <uint32_t N>
 class FastqReader
@@ -25,14 +26,45 @@ class FastqReader
 
     using content_type = std::pair<char *, uint64_t>;
 
+    enum class State
+    {
+        ReadHeader,
+        ReadSequence,
+        ReadPlus,
+        ReadQuality
+    };
+
+    static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
+
+    struct aiocb acbs[2]{};
+    int acbs_index = 0;
+
+    State state_ = State::ReadHeader;
+    int fd_ = -1;
+    off_t file_size_ = 0;
+    off_t have_read_ = 0;
+    uint64_t chunk_size_;
+    std::string filename_;
+    SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *ring_memory_pool_ptr_;
+    std::array<char *, 2> file_buffer_ptr; // 预留给读缓冲参数，保持接口兼容
+    char left_buffer_[128];                // 块在碱基行中间截断时，保存最后(k-1)个碱基用于下块前缀
+    size_t left_buffer_size_ = 0;          // left_buffer_中有效碱基字节数
+
 public:
+#ifdef TEST_MODE
+    uint64_t total_dequeue_spin_time = 0;
+    uint64_t total_enqueue_spin_time = 0;
+    uint64_t aio_wait_spin_time = 0;
+#endif
+
     int k;
 
-    explicit FastqReader(const std::string &filename, const int in_k, uint64_t chunk_size, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_ring_memory_pool_ptr)
-        : filename_(filename), ring_memory_pool_ptr_(in_ring_memory_pool_ptr), file_buffer_(chunk_size),
+    explicit FastqReader(const std::string &filename, const int in_k, uint64_t chunk_size, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_ring_memory_pool_ptr)
+        : total_dequeue_spin_time(0), total_enqueue_spin_time(0), aio_wait_spin_time(0),
+          acbs_index(0), filename_(filename), ring_memory_pool_ptr_(in_ring_memory_pool_ptr),
           k(in_k), chunk_size_(chunk_size)
     {
-        assert(ring_memory_pool_ptr_ != nullptr && "RingMemoryPool pointer must not be null");
+        assert(ring_memory_pool_ptr_ != nullptr && "SPMCRingMemoryPool pointer must not be null");
         assert(k > 0 && "k must be positive");
         assert(k < 128 && "k must be < 128");
         assert(ring_memory_pool_ptr_->blockSize() > 1024 && "block_size must be > 1024");
@@ -42,7 +74,7 @@ public:
             std::cerr << "RingMemoryPool pointer is null" << std::endl;
             std::exit(-1);
         }
-        fd_ = ::open(filename.data(), O_RDONLY | O_LARGEFILE);
+        fd_ = ::open(filename.data(), O_RDONLY);
         if (fd_ == -1)
         {
             std::cerr << "Failed to open file" << std::endl;
@@ -59,6 +91,27 @@ public:
         }
 
         file_size_ = st.st_size;
+
+        file_buffer_ptr[0] = static_cast<char *>(std::aligned_alloc(4096, chunk_size_));
+        file_buffer_ptr[1] = static_cast<char *>(std::aligned_alloc(4096, chunk_size_));
+
+        if (!file_buffer_ptr[0] || !file_buffer_ptr[1])
+        {
+            std::cerr << "Failed to allocate aligned memory for file buffer: " << std::endl;
+            std::exit(-1);
+        }
+
+        bzero(&acbs[0], sizeof(struct aiocb));
+        bzero(&acbs[1], sizeof(struct aiocb));
+
+        acbs[0].aio_fildes = fd_;
+        acbs[1].aio_fildes = fd_;
+        acbs[0].aio_nbytes = chunk_size_;
+        acbs[1].aio_nbytes = chunk_size_;
+
+        acbs[acbs_index].aio_buf = file_buffer_ptr[acbs_index];
+        acbs[acbs_index].aio_offset = have_read_;
+        aio_read(&acbs[acbs_index]);
     }
 
     ~FastqReader()
@@ -102,14 +155,17 @@ public:
 
             if (input_pos >= input_size && !eof)
             {
-                const ssize_t bytes_read = ::read(fd_, file_buffer_.data(), chunk_size_);
+                while (aio_error(&acbs[acbs_index]) == EINPROGRESS)
+                    cpu_relax();
+
+                const ssize_t bytes_read = aio_return(&acbs[acbs_index]);
                 if (bytes_read < 0) [[unlikely]]
                 {
                     std::cerr << "Failed to read fastq data" << std::endl;
                     std::exit(-1);
                 }
 
-                if (bytes_read == 0)
+                if (bytes_read == 0) [[unlikely]]
                 {
                     eof = true;
                 }
@@ -118,6 +174,15 @@ public:
                     input_pos = 0;
                     input_size = static_cast<uint64_t>(bytes_read);
                     have_read_ += bytes_read;
+
+                    acbs_index = 1 - acbs_index; // 切换到另一个缓冲区
+                    bzero(&acbs[acbs_index], sizeof(struct aiocb));
+                    acbs[acbs_index].aio_fildes = fd_;
+                    acbs[acbs_index].aio_nbytes = chunk_size_;
+                    acbs[acbs_index].aio_buf = file_buffer_ptr[acbs_index];
+                    acbs[acbs_index].aio_offset = have_read_;
+                    aio_read(&acbs[acbs_index]);
+
 #ifdef TEST_MODE
                     last_reported_percent = finish_percent;
                     finish_percent = static_cast<double>(have_read_) / static_cast<double>(file_size_);
@@ -126,11 +191,6 @@ public:
                         std::cout << "FastqReader progress: " << static_cast<int>(finish_percent * 100) << "%\n";
                     }
 #endif
-
-                    if (have_read_ + static_cast<off_t>(chunk_size_) < file_size_)
-                    {
-                        ::posix_fadvise(fd_, have_read_, static_cast<size_t>(chunk_size_), POSIX_FADV_WILLNEED);
-                    }
                 }
             }
 
@@ -144,7 +204,7 @@ public:
                 continue;
             }
 
-            const char *input_begin = file_buffer_.data();
+            const char *input_begin = file_buffer_ptr[1 - acbs_index];
 
             if (state_ != State::ReadSequence)
             {
@@ -217,14 +277,6 @@ public:
     }
 
 private:
-    enum class State
-    {
-        ReadHeader,
-        ReadSequence,
-        ReadPlus,
-        ReadQuality
-    };
-
     State advance_state_on_newline(const State current) const
     {
         switch (current)
@@ -243,11 +295,21 @@ private:
     }
 
     void acquire_block(char *&block_ptr,
-                              uint64_t &write_size,
-                              uint64_t &last_newline_pos,
-                              bool &has_block)
+                       uint64_t &write_size,
+                       uint64_t &last_newline_pos,
+                       bool &has_block)
     {
+
+        // int spin_count = 1;
+        // int backoff_iterations = 1;
+
+        // while (!ring_memory_pool_ptr_->producer_try_dequeue(block_ptr))
+        // {
+        //     spin_time++;
+        // }
         ring_memory_pool_ptr_->producer_dequeue(block_ptr);
+
+
         has_block = true;
         write_size = 0;
         last_newline_pos = kNoNewlineInBlock;
@@ -312,19 +374,6 @@ private:
         write_size = 0;
         last_newline_pos = kNoNewlineInBlock;
     }
-
-    static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
-
-    State state_ = State::ReadHeader;
-    int fd_ = -1;
-    off_t file_size_ = 0;
-    off_t have_read_ = 0;
-    uint64_t chunk_size_;
-    std::string filename_;
-    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *ring_memory_pool_ptr_;
-    std::vector<char> file_buffer_; // 预留给读缓冲参数，保持接口兼容
-    char left_buffer_[128];         // 块在碱基行中间截断时，保存最后(k-1)个碱基用于下块前缀
-    size_t left_buffer_size_ = 0;   // left_buffer_中有效碱基字节数
 };
 
 #endif

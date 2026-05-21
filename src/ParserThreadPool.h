@@ -25,7 +25,7 @@ class ParserThreadPool
     int k;
     KmerTree<N> *tree = nullptr;
     ConcurrentMemoryPool *pool = nullptr;
-    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *reader_parser_ring_pool;
+    SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *reader_parser_ring_pool;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *parser_classifier_ring_pool;
     std::vector<std::unique_ptr<std::thread>> threads_ptr;
     const uint32_t parser_count;
@@ -33,13 +33,15 @@ class ParserThreadPool
 
 public:
 #ifdef TEST_MODE
-    std::atomic<uint64_t> total_in_spin_time{0};
-    std::atomic<uint64_t> total_out_spin_time{0};
+    std::atomic<uint64_t> producer_enqueue_spin_time{0};
+    std::atomic<uint64_t> producer_dequeue_spin_time{0};
+    std::atomic<uint64_t> consumer_enqueue_spin_time{0};
+    std::atomic<uint64_t> consumer_dequeue_spin_time{0};
 #endif
 
     explicit ParserThreadPool(const int in_k, KmerTree<N> *tree_ptr,
                               ConcurrentMemoryPool *pool_ptr,
-                              RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool_ptr,
+                              SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool_ptr,
                               RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool_ptr,
                               uint32_t in_parser_count)
         : k(in_k),
@@ -58,14 +60,17 @@ public:
         {
             threads_ptr.push_back(std::make_unique<std::thread>([&]
                                                                 {
+                                                                    std::this_thread::sleep_for(std::chrono::nanoseconds(20));
                                                                     FastqParser<N> parser(k, reader_parser_ring_pool, parser_classifier_ring_pool, tree);
                                                                     parser.parse_and_push();
                                                                     total_read_kmer += parser.get_total_read_kmer();
                                                                     parser_classifier_ring_pool->producer_set_finished();
 
 #ifdef TEST_MODE
-                                                                    total_in_spin_time += parser.in_spin_time;
-                                                                    total_out_spin_time += parser.out_spin_time;
+                                                                    producer_enqueue_spin_time += parser.producer_enqueue_spin_time;
+                                                                    producer_dequeue_spin_time += parser.producer_dequeue_spin_time;
+                                                                    consumer_enqueue_spin_time += parser.consumer_enqueue_spin_time;
+                                                                    consumer_dequeue_spin_time += parser.consumer_dequeue_spin_time;
 #endif
                                                                 }));
         }

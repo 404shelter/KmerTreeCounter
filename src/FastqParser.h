@@ -301,7 +301,7 @@ class FastqParser
     int k_len;
 
     uint64_t total_read_kmer = 0;
-    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *reader_parser_ring_pool;
+    SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *reader_parser_ring_pool;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *parser_classifier_ring_pool;
     KmerTree<N> *tree;
 
@@ -309,11 +309,14 @@ class FastqParser
 
 public:
 #ifdef TEST_MODE
-    uint64_t in_spin_time{0};
-    uint64_t out_spin_time{0};
+    uint64_t producer_enqueue_spin_time{0};
+    uint64_t producer_dequeue_spin_time{0};
+    uint64_t consumer_enqueue_spin_time{0};
+    uint64_t consumer_dequeue_spin_time{0};
+    bool not_first_flag = false;
 #endif
 
-    explicit FastqParser(uint32_t in_k_len, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool,
+    explicit FastqParser(uint32_t in_k_len, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY> *in_reader_parser_ring_pool,
                          RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_parser_classifier_ring_pool, KmerTree<N> *in_tree)
         : k_len(in_k_len), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), tree(in_tree), get_kmer(in_k_len)
     {
@@ -332,15 +335,19 @@ public:
             if (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
             {
 
+#ifdef TEST_MODE
+                not_first_flag = true;
+#endif
+
                 backoff_iterations = 1;
                 spin_count = 0;
-                
+
                 parse(reader_parser_content.data, reader_parser_content.length);
                 // reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
                 while (!reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
                 {
 #ifdef TEST_MODE
-                    out_spin_time++;
+                    consumer_enqueue_spin_time++;
 #endif
 
                     if (spin_count < YIELD_THRESHOLD)
@@ -375,7 +382,8 @@ public:
             {
 
 #ifdef TEST_MODE
-                in_spin_time++;
+                if (not_first_flag)
+                    consumer_dequeue_spin_time++;
 #endif
                 if (spin_count < YIELD_THRESHOLD)
                 {
@@ -500,10 +508,12 @@ private:
                     if (content_kmer_count + static_cast<uint64_t>(run_len) > KMER_BUF_CAP) [[unlikely]]
                     {
                         parser_classifier_content.length = content_kmer_count;
-                        parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+                        enqueue_content_to_classifier(parser_classifier_content);
+                        // parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
                         total_read_kmer += content_kmer_count;
                         content_kmer_count = 0;
-                        parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+                        dequeue_data_from_classifier(parser_classifier_content.data);
+                        // parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
                         kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
                     }
 
@@ -582,10 +592,12 @@ private:
                     if (content_kmer_count + static_cast<uint64_t>(run_len) > KMER_BUF_CAP) [[unlikely]]
                     {
                         parser_classifier_content.length = content_kmer_count;
-                        parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+                        enqueue_content_to_classifier(parser_classifier_content);
+                        // parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
                         total_read_kmer += content_kmer_count;
                         content_kmer_count = 0;
-                        parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+                        dequeue_data_from_classifier(parser_classifier_content.data);
+                        // parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
                         kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
                     }
 
@@ -614,10 +626,12 @@ private:
                 if (content_kmer_count >= (PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>))) [[unlikely]]
                 {
                     parser_classifier_content.length = content_kmer_count;
-                    parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+                    enqueue_content_to_classifier(parser_classifier_content);
+                    // enqueue_content_to_classifier(parser_classifier_content);
                     total_read_kmer += content_kmer_count;
                     content_kmer_count = 0;
-                    parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
+                    dequeue_data_from_classifier(parser_classifier_content.data);
+                    // parser_classifier_ring_pool->producer_dequeue(parser_classifier_content.data);
                     kmer_buffer = reinterpret_cast<kmer<N> *>(parser_classifier_content.data);
                 }
             }
@@ -626,10 +640,74 @@ private:
         if (content_kmer_count > 0)
         {
             parser_classifier_content.length = content_kmer_count;
-            parser_classifier_ring_pool->producer_enqueue(parser_classifier_content);
+            enqueue_content_to_classifier(parser_classifier_content);
             total_read_kmer += content_kmer_count;
         }
         get_kmer.clear();
+    }
+
+private:
+    void enqueue_content_to_classifier(const content_type &content)
+    {
+        int spin_count = 0;
+        int backoff_iterations = 1;
+        while (!parser_classifier_ring_pool->producer_try_enqueue(content))
+        {
+#ifdef TEST_MODE
+            producer_enqueue_spin_time++;
+#endif
+            if (spin_count < YIELD_THRESHOLD)
+            {
+                // 执行 'backoff_iterations' 次暂停指令
+                for (int i = 0; i < backoff_iterations; ++i)
+                {
+                    cpu_relax();
+                }
+                // 指数增加退避时间，直到上限
+                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
+                spin_count++;
+            }
+            else
+            {
+                // 向操作系统让出：如果我们自旋太久，持锁线程
+                // 可能已被抢占。让操作系统调度其他线程。
+                backoff_iterations = 1;
+                spin_count = 0;
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    void dequeue_data_from_classifier(char *&data)
+    {
+        int spin_count = 0;
+        int backoff_iterations = 1;
+
+        while (!parser_classifier_ring_pool->producer_try_dequeue(data))
+        {
+#ifdef TEST_MODE
+            producer_dequeue_spin_time++;
+#endif
+            if (spin_count < YIELD_THRESHOLD)
+            {
+                // 执行 'backoff_iterations' 次暂停指令
+                for (int i = 0; i < backoff_iterations; ++i)
+                {
+                    cpu_relax();
+                }
+                // 指数增加退避时间，直到上限
+                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
+                spin_count++;
+            }
+            else
+            {
+                // 向操作系统让出：如果我们自旋太久，持锁线程
+                // 可能已被抢占。让操作系统调度其他线程。
+                backoff_iterations = 1;
+                spin_count = 0;
+                std::this_thread::yield();
+            }
+        }
     }
 };
 
