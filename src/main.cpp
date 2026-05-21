@@ -89,7 +89,7 @@ int main(int argc, char *argv[])
 
     // 根据预算计算分给 Worker 的解析(Parser)线程和任务(Tasker)线程的数量
     // Worker 预算去除了主线程(Reader)和导出线程(ExportWriter)
-    const uint32_t parser_num = (n_thread / 6 > 0) ? (n_thread / 6) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
+    const uint32_t parser_num = (n_thread / 8 > 0) ? (n_thread / 8) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
     const uint32_t worker_budget = n_thread - 2 - parser_num;
     const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : (uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO));
     const uint32_t tasker_num = worker_budget - classifier_num;
@@ -104,7 +104,7 @@ int main(int argc, char *argv[])
     // 初始化层级队列，用于在树的不同深度间传递任务
     auto layer_queues = std::make_shared<LayerQueues<N1>>();
     // 初始化解析器环形内存池，管理 Reader 读取后的碱基字符串数据块
-    auto reader_parser_ring_pool = std::make_shared<RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, 1, parser_num);
+    auto reader_parser_ring_pool = std::make_shared<SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, 1, parser_num);
     // 初始化分类器环形内存池，管理 Parser 线程处理后的 k-mer 数据块
     auto parser_classifier_ring_pool = std::make_shared<RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>>(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE, parser_num, classifier_num + 1);
     // 初始化导出用的环形内存池，管理低频 k-mer 的导出数据块
@@ -141,7 +141,7 @@ int main(int argc, char *argv[])
     classifier_thread_pool->start();
     task_thread_pool->start();
     export_writer->start();
-    
+
     const auto read_start = std::chrono::steady_clock::now();
 
     // 在主线程中运行读取器，读取文件块并推送给 Parser
@@ -197,10 +197,15 @@ int main(int argc, char *argv[])
 #ifdef TEST_MODE
     SpinLock::flush_spin_loops_for_current_thread();
     std::cout << "SpinLock spin_loops: " << SpinLock::spin_loops() << std::endl;
-    std::cout << "Parser deuque total spin time: " << parser_thread_pool->total_in_spin_time.load() << std::endl;
-    std::cout << "Parser enqueue total spin time: " << parser_thread_pool->total_out_spin_time.load() << std::endl;
-    std::cout << "Classifier dequeue total spin time: " << classifier_thread_pool->total_in_spin_time.load() << std::endl;
-    std::cout << "Classifier enqueue total spin time: " << classifier_thread_pool->total_out_spin_time.load() << std::endl;
+    std::cout << "Parser producer enqueue total spin time: " << parser_thread_pool->producer_enqueue_spin_time.load() << std::endl;
+    std::cout << "Parser producer dequeue total spin time: " << parser_thread_pool->producer_dequeue_spin_time.load() << std::endl;
+    std::cout << "Parser consumer dequeue total spin time: " << parser_thread_pool->consumer_dequeue_spin_time.load() << std::endl;
+    std::cout << "Parser consumer enqueue total spin time: " << parser_thread_pool->consumer_enqueue_spin_time.load() << std::endl;
+    std::cout << "Classifier consumer dequeue total spin time: " << classifier_thread_pool->consumer_dequeue_spin_time.load() << std::endl;
+    std::cout << "Classifier consumer enqueue total spin time: " << classifier_thread_pool->consumer_enqueue_spin_time.load() << std::endl;
+    std::cout << "Classifier producer enqueue total spin time: " << classifier_thread_pool->producer_enqueue_spin_time.load() << std::endl;
+    std::cout << "Classifier producer dequeue total spin time: " << classifier_thread_pool->producer_dequeue_spin_time.load() << std::endl;
+
     /*for (uint64_t i = 0; i < (1ULL << (2 * ROOT_BASES)); ++i)
     {
         std::cout << "Root prefix " << std::format("{:0{}d}", i, 3) << " count: " << root_counts[i].load(std::memory_order_relaxed) << std::endl;

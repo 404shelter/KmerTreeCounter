@@ -16,8 +16,10 @@ class FastqClassifier
 {
 
     // 自旋参数
-    static constexpr int YIELD_THRESHOLD = 128;
-    static constexpr int MAX_BACKOFF = 128;
+    static constexpr int YIELD_THRESHOLD = 256;
+    static constexpr int MAX_BACKOFF = 64;
+
+    static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
 
     int k_len;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *parser_classifier_ring_pool;
@@ -30,16 +32,25 @@ class FastqClassifier
     std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_for_copy{};
     std::bitset<PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> local_block_export_bitmap{};
 
+    ExportBlock<N> *export_block_ptr = nullptr;
+    uint64_t export_kmer_block_count = 0;
+
 public:
 #ifdef TEST_MODE
-    uint64_t in_spin_time{0};
-    uint64_t out_spin_time{0};
+    uint64_t producer_enqueue_spin_time{0};
+    uint64_t producer_dequeue_spin_time{0};
+    uint64_t consumer_enqueue_spin_time{0};
+    uint64_t consumer_dequeue_spin_time{0};
+    bool not_first_flag = false;
 #endif
 
     explicit FastqClassifier(uint32_t in_k_len, RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY> *in_ring_pool, KmerTree<N> *in_tree)
-        : k_len(in_k_len),
-          parser_classifier_ring_pool(in_ring_pool), tree(in_tree)
+        : k_len(in_k_len), parser_classifier_ring_pool(in_ring_pool), tree(in_tree),
+          export_block_ptr(nullptr), export_kmer_block_count(0)
     {
+        char *raw_block_ptr = nullptr;
+        dequeue_data_to_export_writer(raw_block_ptr);
+        export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
     }
 
     void classify_and_push()
@@ -56,6 +67,11 @@ public:
             not_empty = parser_classifier_ring_pool->consumer_try_dequeue(content);
             if (not_empty)
             {
+
+#ifdef TEST_MODE
+                not_first_flag = true;
+#endif
+
                 kmer<N> *kmer_data = reinterpret_cast<kmer<N> *>(content.data);
                 const uint64_t kmer_count = content.length; // length 就是 k-mer数量
                 process_block(kmer_data, kmer_count);
@@ -66,7 +82,7 @@ public:
                 while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
                 {
 #ifdef TEST_MODE
-                    out_spin_time++;
+                    consumer_enqueue_spin_time++;
 #endif
                     if (spin_count < YIELD_THRESHOLD)
                     {
@@ -85,14 +101,15 @@ public:
                     }
                 }
 
-                //parser_classifier_ring_pool->consumer_enqueue(content.data);
+                // parser_classifier_ring_pool->consumer_enqueue(content.data);
                 backoff_iterations = 1;
                 spin_count = 0;
             }
             else
             {
 #ifdef TEST_MODE
-                in_spin_time++;
+                if (not_first_flag)
+                    consumer_dequeue_spin_time++;
 #endif
 
                 if (spin_count < YIELD_THRESHOLD)
@@ -115,6 +132,12 @@ public:
                     std::this_thread::yield();
                 }
             }
+        }
+
+        if (export_kmer_block_count > 0) [[likely]]
+        {
+            enqueue_content_to_export_writer({reinterpret_cast<char *>(export_block_ptr), export_kmer_block_count});
+            export_kmer_block_count = 0;
         }
     }
 
@@ -158,12 +181,8 @@ private:
 
     void classify_local_block(const uint64_t kmer_count) noexcept
     {
-        RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> *export_pool = tree->get_export_ring_pool();
-
-        char *raw_block_ptr = nullptr;
-        export_pool->producer_dequeue(raw_block_ptr);
-        ExportBlock<N> *export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
-        uint64_t export_kmer_count = 0;
+        // char *raw_block_ptr = nullptr;
+        // dequeue_data_to_export_writer(raw_block_ptr);
         uint64_t local_block_count = 0;
 
         kmer<N> last_kmer;
@@ -185,20 +204,21 @@ private:
             for (uint32_t i = 0; i < prefix_count; ++i)
             {
                 const kmer<N> &val = local_block_for_copy[read_offset];
-                // if (bloom_filter->insert(val))
-                // {
-                //     export_block_ptr->k_mers[prefix_export_count++] = val;
-                // }
-                // else
-                // {
-                //     local_block_for_copy[local_block_count] = val;
-                //     local_block_count++;
-                // }
+
                 if (bloom_filter->insert(val))
                 {
                     local_block_export_bitmap.set(read_offset);
-                    export_block_ptr->k_mers[export_kmer_count++] = local_block_for_copy[i];
+                    export_block_ptr->k_mers[export_kmer_block_count++] = local_block_for_copy[i];
                     prefix_export_count++;
+
+                    if (export_kmer_block_count == EXPORT_KMER_BLOCK_CAPACITY) [[unlikely]]
+                    {
+                        enqueue_content_to_export_writer({reinterpret_cast<char *>(export_block_ptr), export_kmer_block_count});
+                        export_kmer_block_count = 0;
+                        char *raw_block_ptr = nullptr;
+                        dequeue_data_to_export_writer(raw_block_ptr);
+                        export_block_ptr = reinterpret_cast<ExportBlock<N> *>(raw_block_ptr);
+                    }
                 }
 
                 read_offset++;
@@ -214,7 +234,8 @@ private:
             }
         }
 
-        export_pool->producer_enqueue({raw_block_ptr, export_kmer_count});
+        // enqueue_content_to_export_writer({raw_block_ptr, export_kmer_block_count});
+        // export_pool->producer_enqueue({raw_block_ptr, export_kmer_count});
 
         if (local_block_count > 0) [[likely]]
         {
@@ -226,6 +247,70 @@ private:
     {
         constexpr uint32_t shift_bits = 64 - (ROOT_BASES * 2);
         return k_mer.data[0] >> shift_bits;
+    }
+
+    void enqueue_content_to_export_writer(const content_type &content)
+    {
+        RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> *export_pool = tree->get_export_ring_pool();
+        int backoff_iterations = 1;
+        int spin_count = 0;
+
+        while (!export_pool->producer_try_enqueue(content))
+        {
+
+#ifdef TEST_MODE
+            producer_enqueue_spin_time++;
+#endif
+            if (spin_count < YIELD_THRESHOLD)
+            {
+                for (int i = 0; i < backoff_iterations; ++i)
+                {
+                    cpu_relax();
+                }
+                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
+                spin_count++;
+            }
+            else
+            {
+                // 向操作系统让出：如果我们自旋太久，持锁线程
+                // 可能已被抢占。让操作系统调度其他线程。
+                backoff_iterations = 1;
+                spin_count = 0;
+                std::this_thread::yield();
+            }
+        }
+    }
+
+    void dequeue_data_to_export_writer(char *&data)
+    {
+        RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY> *export_pool = tree->get_export_ring_pool();
+        int backoff_iterations = 1;
+        int spin_count = 0;
+
+        while (!export_pool->producer_try_dequeue(data))
+        {
+
+#ifdef TEST_MODE
+            producer_dequeue_spin_time++;
+#endif
+            if (spin_count < YIELD_THRESHOLD)
+            {
+                for (int i = 0; i < backoff_iterations; ++i)
+                {
+                    cpu_relax();
+                }
+                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
+                spin_count++;
+            }
+            else
+            {
+                // 向操作系统让出：如果我们自旋太久，持锁线程
+                // 可能已被抢占。让操作系统调度其他线程。
+                backoff_iterations = 1;
+                spin_count = 0;
+                std::this_thread::yield();
+            }
+        }
     }
 };
 

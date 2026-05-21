@@ -19,6 +19,7 @@
 #include <chrono>
 #include <bitset>
 
+
 template <uint32_t N>
 class ClassifierThreadPool
 {
@@ -32,8 +33,10 @@ class ClassifierThreadPool
 
 public:
 #ifdef TEST_MODE
-    std::atomic<uint64_t> total_in_spin_time{0};
-    std::atomic<uint64_t> total_out_spin_time{0};
+    std::atomic<uint64_t> producer_enqueue_spin_time{0};
+    std::atomic<uint64_t> producer_dequeue_spin_time{0};
+    std::atomic<uint64_t> consumer_enqueue_spin_time{0};
+    std::atomic<uint64_t> consumer_dequeue_spin_time{0};
 #endif
 
     explicit ClassifierThreadPool(const int in_k, KmerTree<N> *tree_ptr,
@@ -55,12 +58,15 @@ public:
         {
             threads_ptr.push_back(std::make_unique<std::thread>([&]
                                                                 {
+                                                                    std::this_thread::sleep_for(std::chrono::nanoseconds(40));
                                                                     FastqClassifier<N> parser(k_len, parser_classifier_ring_pool, tree);
                                                                     parser.classify_and_push();
                                                                     task_thread_pool->mark_producer_done();
 #ifdef TEST_MODE
-                                                                    total_in_spin_time += parser.in_spin_time;
-                                                                    total_out_spin_time += parser.out_spin_time;
+                                                                    consumer_enqueue_spin_time += parser.consumer_enqueue_spin_time;
+                                                                    consumer_dequeue_spin_time += parser.consumer_dequeue_spin_time;
+                                                                    producer_enqueue_spin_time += parser.producer_enqueue_spin_time;
+                                                                    producer_dequeue_spin_time += parser.producer_dequeue_spin_time;
 #endif
                                                                 }));
         }
