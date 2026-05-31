@@ -88,6 +88,13 @@ public:
         // const uint64_t h2 = XXH3_64bits_withSeed(k_mer.data.data(), sizeof(kmer<N>), SEED_B) | 1ULL;
         const uint64_t block_idx = 2 * (h1 & mod);
         const uint64_t insert_num = calculate_insert_num(h1, h2);
+
+        const uint64_t second_snapshot = filter_bins[block_idx + 1].load(std::memory_order_relaxed);
+        if ((second_snapshot & insert_num) == insert_num)
+        {
+            return false; // kmer already exists in second filters
+        }
+
         const uint64_t first_snapshot = filter_bins[block_idx].load(std::memory_order_relaxed);
 
         uint64_t second_tieme_bit = first_snapshot & insert_num;
@@ -97,12 +104,10 @@ public:
         }
         if (second_tieme_bit)
         {
-            const uint64_t second_snapshot = filter_bins[block_idx + 1].load(std::memory_order_relaxed);
             if ((second_snapshot & second_tieme_bit) != second_tieme_bit)
             {
                 filter_bins[block_idx + 1].fetch_or(second_tieme_bit, std::memory_order_relaxed);
             }
-
         }
         return second_tieme_bit != insert_num; // kmer not exists in first filters
     }
@@ -149,7 +154,7 @@ public:
         stats.sampled_calls++;
 
         const uint64_t t0 = bloom_read_cycles();
-        //XXH128_hash_t hash_res1 = XXH3_128bits(&k_mer, sizeof(k_mer));
+        // XXH128_hash_t hash_res1 = XXH3_128bits(&k_mer, sizeof(k_mer));
         const uint64_t t1 = bloom_read_cycles();
 
         uint64_t h1, h2;
@@ -157,6 +162,20 @@ public:
         const uint64_t block_idx = 2 * (h1 & mod);
         const uint64_t insert_num = calculate_insert_num(h1, h2);
         const uint64_t t2 = bloom_read_cycles();
+
+        const uint64_t second_load_start = bloom_read_cycles();
+        const uint64_t second_snapshot = filter_bins[block_idx + 1].load(std::memory_order_relaxed);
+        const uint64_t second_load_end = bloom_read_cycles();
+        if((second_snapshot & insert_num) == insert_num)
+        {
+            stats.hash_cycles += t2 - t0;
+            stats.index_mask_cycles += t2 - t1;
+            stats.second_load_cycles += second_load_end - second_load_start;
+            stats.total_cycles += second_load_end - t0;
+
+            stats.true_count++;
+            return false; // kmer already exists in second filters
+        }
 
         const uint64_t first_load_start = t2;
         const uint64_t first_snapshot = filter_bins[block_idx].load(std::memory_order_relaxed);
@@ -182,10 +201,6 @@ public:
         {
             stats.second_layer_attempts++;
             stats.sampled_second_layer_attempts++;
-
-            const uint64_t second_load_start = bloom_read_cycles();
-            const uint64_t second_snapshot = filter_bins[block_idx + 1].load(std::memory_order_relaxed);
-            const uint64_t second_load_end = bloom_read_cycles();
 
             uint64_t second_done = second_load_end;
             if ((second_snapshot & second_tieme_bit) != second_tieme_bit)
