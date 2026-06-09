@@ -31,7 +31,7 @@ class ExportWriter
     constexpr static int MAX_SPIN_TIME = 1024;
     constexpr static int MAX_BACKOFF = 128;
 
-    constexpr static uint64_t RAW_BUFFER_SIZE = 4ULL * 1024 * 1024; // 4MB 原始数据块大小
+    constexpr static uint64_t RAW_BUFFER_SIZE = 1ULL * 1024 * 1024; // 4MB 原始数据块大小
     constexpr static uint64_t BUFFER_KMER_CAPACITY = RAW_BUFFER_SIZE / sizeof(kmer<N>);
 
 private:
