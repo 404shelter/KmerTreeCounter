@@ -291,4 +291,312 @@ private:
 
 };
 
+
+/*
+
+template <uint32_t N>
+class ExportWriter
+{
+
+    constexpr static int MAX_SPIN_TIME = 1024;
+    constexpr static int MAX_BACKOFF = 128;
+
+    //constexpr static uint64_t RAW_BUFFER_SIZE = 1ULL * 1024 * 1024; // 1MB 原始数据块大小
+    constexpr static uint64_t RAW_BUFFER_SIZE = 512 * 1024;
+    constexpr static uint64_t BUFFER_KMER_CAPACITY = RAW_BUFFER_SIZE / sizeof(kmer<N>);
+
+private:
+    // 连接到 FastqParser，用于获取含有低频 k-mer 的数据块
+    uint32_t k;
+    uint64_t full_data_count;
+    uint64_t tail_bits;
+    uint64_t tail_bytes;
+    uint64_t packed_kmer_bytes;
+    RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool = nullptr;
+
+    struct aiocb cbs[2];
+    int fd;
+    bool cbs_active[2];
+    std::array<char*, 2> buffer{};
+    std::array<uint64_t, 2> buffer_count{ 0, 0 }; // 当前缓冲区中 k-mer 的数量
+    uint32_t current_buffer_index = 0;
+    uint64_t file_offset = 0; // 已经写入文件的字节数
+
+    // 专门执行落盘操作的单线程
+    std::thread worker_thread;
+    std::atomic<bool> is_running{ false };
+
+public:
+    ExportWriter() = delete;
+    ExportWriter(const ExportWriter&) = delete;
+    ExportWriter& operator=(const ExportWriter&) = delete;
+    ExportWriter(ExportWriter&&) = delete;
+    ExportWriter& operator=(ExportWriter&&) = delete;
+
+    explicit ExportWriter(uint32_t in_k, RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* pool)
+        : k(in_k), ring_memory_pool(pool), fd(-1)
+    {
+        full_data_count = k / BASES_PER_U64T;
+        tail_bits = 2 * (k % BASES_PER_U64T);
+        tail_bytes = (tail_bits + 7) / 8;
+        packed_kmer_bytes = full_data_count * sizeof(uint64_t) + tail_bytes;
+
+        fd = ::open((temp_dir + "low.bin").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) [[unlikely]]
+        {
+            std::cerr << "Failed to open export file: " << temp_dir + "low.bin" << std::endl;
+            std::exit(-1);
+        }
+
+        for (int i = 0; i < 2; ++i)
+        {
+            std::memset(&cbs[i], 0, sizeof(struct aiocb));
+            buffer[i] = nullptr;
+            buffer_count[i] = 0;
+            cbs_active[i] = false;
+        }
+    }
+
+    void join()
+    {
+        if (is_running && worker_thread.joinable())
+        {
+            worker_thread.join();
+            is_running = false;
+        }
+
+        const std::string filename = temp_dir + "low.bin";
+
+        if (fd >= 0)
+        {
+            ::close(fd);
+            fd = -1;
+        }
+    }
+
+    ~ExportWriter()
+    {
+        if (fd >= 0)
+        {
+            ::close(fd);
+            fd = -1;
+        }
+        for (auto& buf : buffer) {
+            if (buf != nullptr)
+            {
+                delete[] buf;
+                buf = nullptr;
+            }
+        }
+    }
+
+    void start()
+    {
+        is_running = true;
+        worker_thread = std::thread(&ExportWriter::writer_loop, this);
+    }
+
+private:
+    void writer_loop()
+    {
+
+        std::memset(cbs, 0, sizeof(cbs));
+        buffer[0] = new char[RAW_BUFFER_SIZE]();
+        buffer[1] = new char[RAW_BUFFER_SIZE]();
+
+        int spin_time = 0;
+        int backoff = 1;
+
+        char* block_ptr = nullptr;
+
+        content_type content;
+
+        while (true)
+        {
+            if (ring_memory_pool->consumer_try_dequeue(content))
+            {
+                block_ptr = content.data;
+
+                ExportBlock<N>* export_kmer_block = reinterpret_cast<ExportBlock<N> *>(block_ptr);
+                if (content.length > 0) [[likely]]
+                {
+                    process_block(export_kmer_block, content.length);
+                }
+                else {
+                    ring_memory_pool->consumer_enqueue(block_ptr);
+                }
+                // ring_memory_pool->consumer_enqueue(block_ptr);
+
+            }
+            else if (ring_memory_pool->producer_finished())
+            {
+                while (ring_memory_pool->consumer_try_dequeue(content))
+                {
+                    block_ptr = content.data;
+                    ExportBlock<N>* export_kmer_block = reinterpret_cast<ExportBlock<N> *>(block_ptr);
+                    if (content.length > 0) [[likely]]
+                    {
+                        process_block(export_kmer_block, content.length);
+                    }
+                    else {
+                        ring_memory_pool->consumer_enqueue(block_ptr);
+                    }
+                    // ring_memory_pool->consumer_enqueue(block_ptr);
+                }
+                break;
+            }
+            else
+            {
+                spin_time++;
+                if (spin_time >= MAX_SPIN_TIME)
+                {
+                    std::this_thread::yield();
+                    spin_time = 0;
+                    backoff = 4;
+                }
+                else
+                {
+                    for (int i = 0; i < backoff; i++)
+                    {
+                        cpu_relax();
+                    }
+                    backoff = std::min(backoff * 2, MAX_BACKOFF);
+                }
+            }
+        }
+
+
+        wait_write_finish(1 - current_buffer_index);
+
+        if (buffer_count[current_buffer_index] > 0)
+        {
+            async_write(current_buffer_index);
+            wait_write_finish(current_buffer_index);
+        }
+
+        if (buffer[0]) delete[] buffer[0];
+        if (buffer[1]) delete[] buffer[1];
+        buffer[0] = nullptr;
+        buffer[1] = nullptr;
+    }
+
+    void process_block(ExportBlock<N>* export_block_ptr, uint64_t kmer_amount)
+    {
+        if (buffer_count[current_buffer_index] + kmer_amount * packed_kmer_bytes >= RAW_BUFFER_SIZE) [[unlikely]]
+        {
+            uint64_t to_write = (RAW_BUFFER_SIZE - buffer_count[current_buffer_index]) / packed_kmer_bytes;
+            byte_pack_to_buffer(export_block_ptr->k_mers.data(), to_write, current_buffer_index);
+            uint64_t remaining = kmer_amount - to_write;
+
+            async_write(current_buffer_index);
+
+            current_buffer_index = 1 - current_buffer_index;
+            wait_write_finish(current_buffer_index);
+
+
+            byte_pack_to_buffer(export_block_ptr->k_mers.data() + to_write, remaining, current_buffer_index);
+
+            ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(export_block_ptr));
+
+        }
+        else
+        {
+            byte_pack_to_buffer(export_block_ptr->k_mers.data(), kmer_amount, current_buffer_index);
+            ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(export_block_ptr));
+        }
+    }
+
+    void byte_pack_to_buffer(kmer<N>* kmer_data, const uint64_t kmer_count, const uint32_t current_buffer_index)
+    {
+        uint64_t mask = 0;
+        if (tail_bytes > 0) {
+            mask = (~uint64_t{ 0 }) << (64 - tail_bits);
+        }
+        for (uint64_t i = 0; i < kmer_count; ++i)
+        {
+            std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], kmer_data[i].data.data(), full_data_count * sizeof(uint64_t));
+            buffer_count[current_buffer_index] += full_data_count * sizeof(uint64_t);
+
+            if (tail_bytes > 0)
+            {
+                uint64_t tail_data = kmer_data[i].data[full_data_count];
+                tail_data &= mask;
+
+                if constexpr (std::endian::native == std::endian::little)
+                {
+                    std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
+                }
+                else
+                {
+                    std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data), tail_bytes);
+                }
+                buffer_count[current_buffer_index] += tail_bytes;
+            }
+        }
+    }
+
+    void wait_write_finish(const uint32_t buffer_index)
+    {
+        if (!cbs_active[buffer_index]) [[unlikely]]
+        {
+            return;
+        }
+
+        const aiocb* list[1] = { &cbs[buffer_index] };
+        int err;
+        while ((err = ::aio_error(&cbs[buffer_index])) == EINPROGRESS)
+        {
+            if (::aio_suspend(list, 1, nullptr) != 0 && errno != EINTR) [[unlikely]]
+            {
+                std::cerr << "aio_suspend failed\n";
+                std::exit(-1);
+            }
+        }
+
+        err = ::aio_error(&cbs[buffer_index]);
+        if (err != 0) [[unlikely]]
+        {
+            std::cerr << "aio_write error\n";
+            std::exit(-1);
+        }
+
+        ssize_t n = ::aio_return(&cbs[buffer_index]);
+        if (n != static_cast<ssize_t>(cbs[buffer_index].aio_nbytes)) [[unlikely]]
+        {
+            std::cerr << "partial aio_write\n";
+            std::exit(-1);
+        }
+
+        cbs_active[buffer_index] = false;
+    }
+
+    void async_write(const uint32_t buffer_index)
+    {
+        std::memset(&cbs[buffer_index], 0, sizeof(struct aiocb));
+        cbs[buffer_index].aio_fildes = fd;
+        cbs[buffer_index].aio_buf = buffer[buffer_index];
+        cbs[buffer_index].aio_nbytes = buffer_count[buffer_index];
+        cbs[buffer_index].aio_offset = file_offset;
+
+        if (::aio_write(&cbs[buffer_index]) != 0) [[unlikely]]
+        {
+            std::cerr << "aio_write failed\n";
+            std::exit(-1);
+        }
+
+        file_offset += buffer_count[buffer_index];
+        buffer_count[buffer_index] = 0;
+        cbs_active[buffer_index] = true;
+    }
+
+    constexpr uint64_t get_root_prefix(const kmer<N>& val) const
+    {
+        constexpr uint32_t shift = 2 * (BASES_PER_U64T - ROOT_BASES);
+        return val.data[0] >> shift;
+    }
+
+};
+
+*/
+
 #endif // EXPORT_WRITER_HEADER
