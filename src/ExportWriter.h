@@ -24,7 +24,7 @@
 #include <errno.h>
 #include <aio.h>
 
-
+/*
 template <uint32_t N>
 class ExportWriter
 {
@@ -195,8 +195,8 @@ private:
             wait_write_finish(current_buffer_index);
         }
 
-        if(!buffer[0]) delete[] buffer[0];
-        if(!buffer[1]) delete[] buffer[1];
+        if (!buffer[0]) delete[] buffer[0];
+        if (!buffer[1]) delete[] buffer[1];
         buffer[0] = nullptr;
         buffer[1] = nullptr;
     }
@@ -216,16 +216,14 @@ private:
 
 
             std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], export_block_ptr->k_mers.data() + to_write, remaining * sizeof(kmer<N>));
-            buffer_count[current_buffer_index] = remaining;
-
             ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(export_block_ptr));
-
+            buffer_count[current_buffer_index] = remaining;
         }
         else
         {
             std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], export_block_ptr->k_mers.data(), kmer_amount * sizeof(kmer<N>));
-            buffer_count[current_buffer_index] += kmer_amount;
             ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(export_block_ptr));
+            buffer_count[current_buffer_index] += kmer_amount;
         }
     }
 
@@ -289,10 +287,10 @@ private:
         return val.data[0] >> shift;
     }
 
-};
+};*/
 
 
-/*
+
 
 template <uint32_t N>
 class ExportWriter
@@ -597,6 +595,6 @@ private:
 
 };
 
-*/
+
 
 #endif // EXPORT_WRITER_HEADER
