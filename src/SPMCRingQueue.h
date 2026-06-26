@@ -56,9 +56,8 @@ public:
         {
             cell = &buffer[pos & mask];
             const std::size_t seq = cell->sequence.load(std::memory_order_acquire);
-            const auto diff = static_cast<std::int64_t>(seq) - static_cast<std::int64_t>(pos);
 
-            if (diff == 0)
+            if (seq == pos)
             {
                 enqueue_pos.store(pos + 1, std::memory_order_relaxed);
                 cell->data = item;
@@ -66,13 +65,14 @@ public:
                 cell->sequence.store(pos + 1, std::memory_order_release);
                 return true;
             }
-            else if (diff < 0)
+            else if (seq < pos)
             {
                 return false; // genuinely full
             }
 
-            // diff > 0: another producer advanced enqueue_pos; retry with fresh pos.
+            // seq > pos: another producer advanced enqueue_pos; retry with fresh pos.
             pos = enqueue_pos.load(std::memory_order_relaxed);
+            cpu_relax();
         }
     }
 
@@ -109,9 +109,8 @@ public:
         {
             cell = &buffer[pos & mask];
             const std::size_t seq = cell->sequence.load(std::memory_order_acquire);
-            const auto diff = static_cast<std::int64_t>(seq) - static_cast<std::int64_t>(pos + 1);
 
-            if (diff == 0)
+            if (seq == pos + 1)
             {
                 if (dequeue_pos.compare_exchange_weak(
                     pos, pos + 1,
@@ -126,13 +125,14 @@ public:
                 // CAS failed: pos has been updated by compare_exchange_weak.
                 continue;
             }
-            else if (diff < 0)
+            else if (seq < pos + 1)
             {
                 return false; // genuinely empty
             }
 
-            // diff > 0: another consumer advanced dequeue_pos; retry with fresh pos.
+            // seq > pos + 1: another consumer advanced dequeue_pos; retry with fresh pos.
             pos = dequeue_pos.load(std::memory_order_relaxed);
+            cpu_relax();
         }
     }
 

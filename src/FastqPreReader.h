@@ -84,7 +84,7 @@ public:
 
         file_size_ = st.st_size;
 
-        need_read_ = std::min(file_size_, (ssize_t)128U * 1024 * 1024);
+        need_read_ = std::min(file_size_, (ssize_t)256U * 1024 * 1024);
 
         file_buffer = new char[chunk_size_];
     }

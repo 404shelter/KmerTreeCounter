@@ -301,6 +301,7 @@ class ExportWriter
 
     //constexpr static uint64_t RAW_BUFFER_SIZE = 1ULL * 1024 * 1024; // 1MB 原始数据块大小
     constexpr static uint64_t RAW_BUFFER_SIZE = 512 * 1024;
+    static_assert(RAW_BUFFER_SIZE >= EXPORT_RING_MEMORY_POOL_BLOCK_SIZE, "RAW_BUFFER_SIZE must be greater than or equal to EXPORT_RING_MEMORY_POOL_BLOCK_SIZE");
     constexpr static uint64_t BUFFER_KMER_CAPACITY = RAW_BUFFER_SIZE / sizeof(kmer<N>);
 
 private:
@@ -407,6 +408,9 @@ private:
 
         char* block_ptr = nullptr;
 
+        buffer_count[0] = 0;
+        buffer_count[1] = 0;
+
         content_type content;
 
         while (true)
@@ -480,6 +484,8 @@ private:
 
     void process_block(ExportBlock<N>* export_block_ptr, uint64_t kmer_amount)
     {
+        // test_byte_pack(export_block_ptr, kmer_amount);
+        // return;
         if (buffer_count[current_buffer_index] + kmer_amount * packed_kmer_bytes >= RAW_BUFFER_SIZE) [[unlikely]]
         {
             uint64_t to_write = (RAW_BUFFER_SIZE - buffer_count[current_buffer_index]) / packed_kmer_bytes;
@@ -504,6 +510,29 @@ private:
         }
     }
 
+    void test_byte_pack(ExportBlock<N>* export_block_ptr, uint64_t kmer_amount)
+    {
+        if (buffer_count[current_buffer_index] + kmer_amount * packed_kmer_bytes >= RAW_BUFFER_SIZE) [[unlikely]]
+        {
+            uint64_t to_write = (RAW_BUFFER_SIZE - buffer_count[current_buffer_index]) / packed_kmer_bytes;
+            byte_pack_to_buffer(export_block_ptr->k_mers.data(), to_write, current_buffer_index);
+            uint64_t remaining = kmer_amount - to_write;
+            buffer_count[current_buffer_index] = 0;
+            current_buffer_index = 1 - current_buffer_index;
+
+            byte_pack_to_buffer(export_block_ptr->k_mers.data() + to_write, remaining, current_buffer_index);
+
+            ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(export_block_ptr));
+
+        }
+        else
+        {
+            byte_pack_to_buffer(export_block_ptr->k_mers.data(), kmer_amount, current_buffer_index);
+
+            ring_memory_pool->consumer_enqueue(reinterpret_cast<char*>(export_block_ptr));
+        }
+    }
+
     void byte_pack_to_buffer(kmer<N>* kmer_data, const uint64_t kmer_count, const uint32_t current_buffer_index)
     {
         uint64_t mask = 0;
@@ -520,14 +549,15 @@ private:
                 uint64_t tail_data = kmer_data[i].data[full_data_count];
                 tail_data &= mask;
 
-                if constexpr (std::endian::native == std::endian::little)
-                {
-                    std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
-                }
-                else
-                {
-                    std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data), tail_bytes);
-                }
+                std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
+                // if constexpr (std::endian::native == std::endian::little)
+                // {
+                //     std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
+                // }
+                // else
+                // {
+                //     std::memcpy(buffer[current_buffer_index] + buffer_count[current_buffer_index], reinterpret_cast<const char*>(&tail_data), tail_bytes);
+                // }
                 buffer_count[current_buffer_index] += tail_bytes;
             }
         }

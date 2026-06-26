@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -147,15 +148,39 @@ namespace
         const std::string& output_name,
         const std::string& memory_gb = "1")
     {
+        const std::filesystem::path output_path = dir / output_name;
+        const std::filesystem::path stdout_path = dir / "tool_stdout.txt";
         const std::string command =
             shell_quote(tool_path) + " " +
             shell_quote(dir.generic_string()) + " " +
             std::to_string(k_len) + " 4 " +
             memory_gb + " " +
-            shell_quote(output_name) + " " +
+            shell_quote(output_path.generic_string()) + " " +
             std::to_string(min_freq) + " " +
-            std::to_string(max_freq);
+            std::to_string(max_freq) +
+            " > " + shell_quote(stdout_path.generic_string());
         return std::system(command.c_str());
+    }
+
+    bool expect_progress_output(const std::filesystem::path& dir, const char* label)
+    {
+        std::ifstream input(dir / "tool_stdout.txt");
+        if (!input)
+        {
+            std::cerr << label << " missing stdout capture\n";
+            return false;
+        }
+
+        const std::string content(
+            (std::istreambuf_iterator<char>(input)),
+            std::istreambuf_iterator<char>());
+        if (content.find("progress 0%") == std::string::npos ||
+            content.find("progress 100%") == std::string::npos)
+        {
+            std::cerr << label << " progress output missing 0% or 100%\n";
+            return false;
+        }
+        return true;
     }
 
     bool expect_histogram(
@@ -187,10 +212,10 @@ namespace
     {
         const std::filesystem::path dir = make_test_dir("tmp_histogram_k33");
 
-        const Kmer<2> a = make_kmer<2>({0x0123456789abcdefULL, 0xc00000000000ffffULL});
-        const Kmer<2> b = make_kmer<2>({0x1111111111111111ULL, 0x800000000000aaaaULL});
-        const Kmer<2> c = make_kmer<2>({0x2222222222222222ULL, 0x400000000000bbbbULL});
-        const Kmer<2> e = make_kmer<2>({0x3333333333333333ULL, 0x000000000000ccccULL});
+        const Kmer<2> a = make_kmer<2>({0x0123456789abcdefULL, 0xc000000000000000ULL});
+        const Kmer<2> b = make_kmer<2>({0x1111111111111111ULL, 0x8000000000000000ULL});
+        const Kmer<2> c = make_kmer<2>({0x2222222222222222ULL, 0x4000000000000000ULL});
+        const Kmer<2> e = make_kmer<2>({0x3333333333333333ULL, 0x0000000000000000ULL});
 
         write_root_file<2>(dir, 0, {
             Record<2>{a, 2},
@@ -205,17 +230,18 @@ namespace
             return false;
         }
 
-        return expect_histogram(dir / "hist.tsv", {1, 1, 1, 0}, "k33");
+        return expect_progress_output(dir, "k33") &&
+            expect_histogram(dir / "hist.tsv", {1, 1, 1, 0}, "k33");
     }
 
     bool test_min_filter(const std::string& tool_path)
     {
         const std::filesystem::path dir = make_test_dir("tmp_histogram_min_filter");
 
-        const Kmer<2> g = make_kmer<2>({0x4444444444444444ULL, 0xc000000000000001ULL});
-        const Kmer<2> h = make_kmer<2>({0x5555555555555555ULL, 0x8000000000000002ULL});
-        const Kmer<2> i = make_kmer<2>({0x6666666666666666ULL, 0x4000000000000003ULL});
-        const Kmer<2> j = make_kmer<2>({0x7777777777777777ULL, 0x0000000000000004ULL});
+        const Kmer<2> g = make_kmer<2>({0x4444444444444444ULL, 0xc000000000000000ULL});
+        const Kmer<2> h = make_kmer<2>({0x5555555555555555ULL, 0x8000000000000000ULL});
+        const Kmer<2> i = make_kmer<2>({0x6666666666666666ULL, 0x4000000000000000ULL});
+        const Kmer<2> j = make_kmer<2>({0x7777777777777777ULL, 0x0000000000000000ULL});
 
         write_root_file<2>(dir, 1, {
             Record<2>{g, 1},
@@ -258,7 +284,7 @@ namespace
                 0xaaaaaaaa55555555ULL,
                 0x0123456789abcdefULL,
                 0xc000000000000000ULL,
-                0xffffffffffffffffULL});
+                0x0000000000000000ULL});
             write_root_file<4>(dir, 3, {Record<4>{key, 1}});
             write_low_bin<4>(dir, 65, {key});
 

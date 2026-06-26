@@ -17,6 +17,8 @@
 #include <utility>
 #include <iostream>
 #include <sys/mman.h>
+#include <thread>
+#include <vector>
 
 
 #if defined(__AVX2__)
@@ -38,28 +40,43 @@ template <uint32_t N>
 class FlatConcurrentHashMap
 {
 public:
-    static constexpr double LOAD_FACTOR = 0.75;
+    static constexpr double LOAD_FACTOR = 0.65;
     static constexpr uint64_t GROUP_SIZE = FLAT_HASHMAP_GROUP_SIZE;
 
     using Entry = ExportRecord<N>;
+
+    struct PreparedLookup
+    {
+        uint64_t base = 0;
+        uint8_t fp = 0;
+    };
 
     [[nodiscard]] static uint64_t required_mmap_bytes(uint64_t expected_unique_key)
     {
         return calculate_layout(expected_unique_key).mmap_bytes;
     }
 
-    explicit FlatConcurrentHashMap(uint64_t expected_unique)
-        : FlatConcurrentHashMap(calculate_layout(expected_unique))
+    explicit FlatConcurrentHashMap(uint64_t expected_unique, uint32_t in_n_thread = 1)
+        : FlatConcurrentHashMap(calculate_layout(expected_unique), in_n_thread)
     {
     }
 
     ~FlatConcurrentHashMap() noexcept
     {
-        if (mmap_base_ != nullptr)
+        if (ctrl_ != nullptr)
         {
-            munmap(mmap_base_, static_cast<size_t>(mmap_size_));
-            mmap_base_ = nullptr;
-            mmap_size_ = 0;
+            munmap(ctrl_, ctrl_size_);
+            ctrl_ = nullptr;
+        }
+        if (kmer_ != nullptr)
+        {
+            munmap(kmer_, kmer_size_);
+            kmer_ = nullptr;
+        }
+        if (count_ != nullptr)
+        {
+            munmap(count_, count_size_);
+            count_ = nullptr;
         }
     }
 
@@ -84,7 +101,12 @@ public:
             for (uint64_t offset = 0; offset < GROUP_SIZE; ++offset)
             {
                 const uint64_t slot = wrap_slot(base + offset);
-                std::atomic_ref<uint8_t> ctrl_ref(ctrl_[static_cast<size_t>(slot)]);
+                std::atomic_ref<uint8_t> ctrl_ref(ctrl_[slot]);
+                if (ctrl_ref.load(std::memory_order_acquire) != 0)
+                {
+                    cpu_relax();
+                    continue;
+                }
                 uint8_t expected = 0;
                 if (ctrl_ref.compare_exchange_strong(
                     expected,
@@ -92,10 +114,14 @@ public:
                     std::memory_order_acq_rel,
                     std::memory_order_acquire))
                 {
-                    std::construct_at(entries_ + static_cast<size_t>(slot), Entry{ key, count });
-                    size_.fetch_add(1, std::memory_order_relaxed);
+                    kmer<N>& k_mer = kmer_[slot];
+                    k_mer = key;
+                    count_[slot] = count;
+
+                    // size_.fetch_add(1, std::memory_order_relaxed);
                     return true;
                 }
+                cpu_relax();
             }
             base = next_group_base(base);
         }
@@ -114,14 +140,39 @@ public:
 
     bool find(const kmer<N>& key, uint32_t& out_count) const noexcept
     {
-        if (!sealed_.load(std::memory_order_acquire)) [[unlikely]]
-        {
-            return false;
-        }
+        const PreparedLookup lookup = prepare_lookup(key);
+        return find_prepared(key, lookup, out_count);
+    }
 
+    [[nodiscard]] PreparedLookup prepare_lookup(const kmer<N>& key) const noexcept
+    {
         const uint64_t hash = XXH3_64bits(&key, sizeof(key));
-        const uint8_t fp = fingerprint(hash);
-        uint64_t base = initial_slot(hash);
+        return PreparedLookup{ initial_slot(hash), fingerprint(hash) };
+    }
+
+    void prefetch(const PreparedLookup& lookup) const noexcept
+    {
+        constexpr int CTRL_PREFETCH_LOCALITY = 0;
+        constexpr int KMER_PREFETCH_LOCALITY = 0;
+        constexpr int COUNT_PREFETCH_LOCALITY = 0;
+#if defined(__GNUC__) || defined(__clang__)
+        const uint8_t* ctrl = ctrl_ + lookup.base;
+        const kmer<N>* k_mer = kmer_ + lookup.base;
+        const uint32_t* count = count_ + lookup.base;
+        __builtin_prefetch(ctrl, 0, CTRL_PREFETCH_LOCALITY);
+        // __builtin_prefetch(ctrl + GROUP_SIZE - 1, 0, CTRL_PREFETCH_LOCALITY);
+        __builtin_prefetch(k_mer, 0, KMER_PREFETCH_LOCALITY);
+        __builtin_prefetch(count, 0, COUNT_PREFETCH_LOCALITY);
+
+#else
+        (void)lookup;
+#endif
+    }
+
+    bool find_prepared(const kmer<N>& key, const PreparedLookup& lookup, uint32_t& out_count) const noexcept
+    {
+        const uint8_t fp = lookup.fp;
+        uint64_t base = lookup.base;
 
         for (uint64_t probe = 0; probe < group_count_; ++probe)
         {
@@ -133,10 +184,10 @@ public:
             {
                 const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(match_mask));
                 const uint64_t slot = wrap_slot(base + bit);
-                const Entry& entry = entries_[static_cast<size_t>(slot)];
-                if (entry.key == key) [[likely]]
+                const kmer<N>& k_mer = kmer_[slot];
+                if (k_mer == key) [[likely]]
                 {
-                    out_count = entry.count;
+                    out_count = count_[slot];
                     return true;
                 }
                 match_mask &= match_mask - 1;
@@ -176,21 +227,26 @@ private:
     {
         uint64_t capacity;
         uint64_t ctrl_bytes;
-        uint64_t entries_offset;
-        uint64_t entries_bytes;
-        uint64_t payload_bytes;
+        uint64_t kmer_bytes;
+        uint64_t count_bytes;
         uint64_t mmap_bytes;
     };
 
-    explicit FlatConcurrentHashMap(const Layout& layout)
+    explicit FlatConcurrentHashMap(const Layout& layout, uint32_t in_n_thread)
         : capacity_(layout.capacity),
+        inv_(((__uint128_t)1 << 64) / capacity_),
         group_count_(capacity_ / GROUP_SIZE),
-        mmap_base_(map_memory(layout.mmap_bytes)),
         mmap_size_(layout.mmap_bytes),
-        ctrl_(static_cast<uint8_t*>(mmap_base_)),
-        entries_(reinterpret_cast<Entry*>(static_cast<uint8_t*>(mmap_base_) + layout.entries_offset))
+        ctrl_size_(layout.ctrl_bytes),
+        kmer_size_(layout.kmer_bytes),
+        count_size_(layout.count_bytes),
+        n_thread(in_n_thread)
     {
-        std::memset(ctrl_, 0, static_cast<size_t>(layout.ctrl_bytes));
+        std::tuple<void*, void*, void*> ptrs;
+        ptrs = mmap_hash_map_memory(ctrl_size_, kmer_size_, count_size_);
+        ctrl_ = static_cast<uint8_t*>(std::get<0>(ptrs));
+        kmer_ = static_cast<kmer<N>*>(std::get<1>(ptrs));
+        count_ = static_cast<uint32_t*>(std::get<2>(ptrs));
     }
 
     static uint64_t round_up(uint64_t value, uint64_t alignment) noexcept
@@ -228,15 +284,15 @@ private:
     {
         const uint64_t capacity = calculate_capacity(expected_unique_key);
 
-        const uint64_t ctrl_bytes = capacity + GROUP_SIZE - 1;
-        const uint64_t entries_offset = (CACHE_LINE_SIZE % alignof(Entry) == 0) ? round_up(ctrl_bytes, CACHE_LINE_SIZE) : round_up(ctrl_bytes, alignof(Entry));
+        const uint64_t ctrl_bytes = round_up(capacity + GROUP_SIZE - 1, 2LL * 1024 * 1024);
 
-        const uint64_t entries_bytes = capacity * sizeof(Entry);
+        const uint64_t kmer_bytes = round_up(capacity * sizeof(kmer<N>), 2ULL * 1024 * 1024);
 
-        const uint64_t payload_bytes = entries_offset + entries_bytes;
-        const uint64_t mmap_bytes = round_up(payload_bytes, HUGE_PAGE_BYTES);
+        const uint64_t count_bytes = round_up(capacity * sizeof(uint32_t), 2ULL * 1024 * 1024);
 
-        return Layout{ capacity, ctrl_bytes, entries_offset, entries_bytes, payload_bytes, mmap_bytes };
+        const uint64_t mmap_bytes = ctrl_bytes + kmer_bytes + count_bytes;
+
+        return Layout{ capacity, ctrl_bytes, kmer_bytes, count_bytes, mmap_bytes };
     }
 
     static void* map_memory(uint64_t mmap_bytes)
@@ -247,6 +303,7 @@ private:
         }
 
         const size_t length = static_cast<size_t>(mmap_bytes);
+        std::cout << "attempting to mmap " << length << " bytes with huge pages" << std::endl;
         void* base = mmap(nullptr,
             length,
             PROT_READ | PROT_WRITE,
@@ -258,6 +315,8 @@ private:
         {
             return base;
         }
+
+        std::cout << "mmap with huge pages failed, falling back to regular pages" << std::endl;
 
         base = mmap(nullptr,
             length,
@@ -275,6 +334,85 @@ private:
         return base;
     }
 
+    std::tuple<void*, void*, void*> mmap_hash_map_memory(uint64_t ctrl_bytes, uint64_t kmer_bytes, uint64_t count_bytes)
+    {
+
+        constexpr size_t PAGE_SIZE_2MB = 2 * 1024 * 1024;
+
+        std::vector<std::pair<void*, uint64_t>> ctrl_range;
+        std::vector<std::pair<void*, uint64_t>> kmer_range;
+        std::vector<std::pair<void*, uint64_t>> count_range;
+
+        uint8_t* ctrl_ptr = static_cast<uint8_t*>(map_memory(ctrl_bytes));
+        kmer<N>* kmer_ptr = static_cast<kmer<N>*>(map_memory(kmer_bytes));
+        uint32_t* count_ptr = static_cast<uint32_t*>(map_memory(count_bytes));
+
+
+        uint64_t ctrl_total_pages = ctrl_bytes / PAGE_SIZE_2MB;
+        uint64_t kmer_total_pages = kmer_bytes / PAGE_SIZE_2MB;
+        uint64_t count_total_pages = count_bytes / PAGE_SIZE_2MB;
+
+        for (uint32_t i = 0;i < n_thread;i++)
+        {
+            size_t ctrl_start_page = (i * ctrl_total_pages) / n_thread;
+            size_t ctrl_end_page = (i + 1) * ctrl_total_pages / n_thread;
+            size_t ctrl_my_pages = ctrl_end_page - ctrl_start_page;           // 该线程负责的 2 MB 页数
+            char* ctrl_my_start = (char*)ctrl_ptr + ctrl_start_page * PAGE_SIZE_2MB; // 起始地址
+            ctrl_range.emplace_back(ctrl_my_start, ctrl_my_pages);
+
+            size_t kmer_start_page = (i * kmer_total_pages) / n_thread;
+            size_t kmer_end_page = (i + 1) * kmer_total_pages / n_thread;
+            size_t kmer_my_pages = kmer_end_page - kmer_start_page;           // 该线程负责的 2 MB 页数
+            char* kmer_my_start = (char*)kmer_ptr + kmer_start_page * PAGE_SIZE_2MB; // 起始地址
+            kmer_range.emplace_back(kmer_my_start, kmer_my_pages);
+
+            size_t count_start_page = (i * count_total_pages) / n_thread;
+            size_t count_end_page = (i + 1) * count_total_pages / n_thread;
+            size_t count_my_pages = count_end_page - count_start_page;           // 该线程负责的 2 MB 页数
+            char* count_my_start = (char*)count_ptr + count_start_page * PAGE_SIZE_2MB; // 起始地址
+            count_range.emplace_back(count_my_start, count_my_pages);
+        }
+
+        std::vector<std::thread> threads;
+        for (uint32_t i = 0;i < n_thread;i++)
+        {
+            threads.emplace_back([&, i]()
+                {
+                    for (size_t j = 0; j < ctrl_range[i].second; ++j)
+                    {
+                        volatile char* page_addr = ((volatile char*)ctrl_range[i].first) + j * PAGE_SIZE_2MB;
+                        *page_addr = 0;
+                    }
+                    for (size_t j = 0; j < kmer_range[i].second; ++j)
+                    {
+                        volatile char* page_addr = ((volatile char*)kmer_range[i].first) + j * PAGE_SIZE_2MB;
+                        *page_addr = 0;
+                    }
+                    for (size_t j = 0; j < count_range[i].second; ++j)
+                    {
+                        volatile char* page_addr = ((volatile char*)count_range[i].first) + j * PAGE_SIZE_2MB;
+                        *page_addr = 0;
+                    }
+                });
+        }
+
+        for (auto& t : threads)
+        {
+            t.join();
+        }
+
+        return std::make_tuple(ctrl_ptr, kmer_ptr, count_ptr);
+    }
+
+    uint64_t fast_mod(const uint64_t value) const noexcept
+    {
+        uint64_t q = (uint64_t)((__uint128_t)inv_ * value >> 64);
+        uint64_t r = value - q * capacity_;
+        r = (r >= capacity_) ? (r - capacity_) : r;
+        return r;
+        // return value % capacity_;
+    }
+
     static uint8_t fingerprint(uint64_t hash) noexcept
     {
         return static_cast<uint8_t>((hash & 0x7FULL) | 0x80U);
@@ -282,7 +420,7 @@ private:
 
     uint64_t initial_slot(uint64_t hash) const noexcept
     {
-        return (hash >> 7) % capacity_;
+        return fast_mod(hash >> 7);
     }
 
     uint64_t wrap_slot(uint64_t slot) const noexcept
@@ -332,17 +470,22 @@ private:
             {
                 empty_mask |= (1U << i);
             }
-    }
+        }
         return { match_mask, empty_mask };
 #endif
-}
+    }
 
     const uint64_t capacity_;
     const uint64_t group_count_;
-    void* mmap_base_ = nullptr;
+    const uint64_t inv_;
     uint64_t mmap_size_ = 0;
     uint8_t* ctrl_ = nullptr;
-    Entry* entries_ = nullptr;
+    uint64_t ctrl_size_ = 0;
+    kmer<N>* kmer_ = nullptr;
+    uint64_t kmer_size_ = 0;
+    uint32_t* count_ = nullptr;
+    uint64_t count_size_ = 0;
+    uint32_t n_thread;
     alignas(64) std::atomic<uint64_t> size_{ 0 };
     std::atomic<bool> sealed_{ false };
 };

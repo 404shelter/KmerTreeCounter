@@ -91,6 +91,40 @@ namespace
             std::cerr << label << " contains() should be true\n";
             return false;
         }
+
+        const auto lookup = map.prepare_lookup(key);
+        map.prefetch(lookup);
+        uint32_t prepared_actual = 0;
+        if (!map.find_prepared(key, lookup, prepared_actual))
+        {
+            std::cerr << label << " should be found with prepared lookup\n";
+            return false;
+        }
+        if (prepared_actual != expected)
+        {
+            std::cerr << label << " prepared count mismatch: expected " << expected
+                << ", got " << prepared_actual << "\n";
+            return false;
+        }
+        return true;
+    }
+
+    bool expect_not_found(const FlatConcurrentHashMap<kWords>& map, const Kmer& key, const char* label)
+    {
+        uint32_t ignored = 0;
+        if (map.find(key, ignored))
+        {
+            std::cerr << label << " should not be found\n";
+            return false;
+        }
+
+        const auto lookup = map.prepare_lookup(key);
+        map.prefetch(lookup);
+        if (map.find_prepared(key, lookup, ignored))
+        {
+            std::cerr << label << " should not be found with prepared lookup\n";
+            return false;
+        }
         return true;
     }
 
@@ -112,12 +146,6 @@ namespace
             }
         }
 
-        if (map.size() != record_count)
-        {
-            std::cerr << "single-thread size mismatch\n";
-            return false;
-        }
-
         map.seal();
 
         for (uint64_t i = 0; i < record_count; ++i)
@@ -128,13 +156,7 @@ namespace
             }
         }
 
-        uint32_t ignored = 0;
-        if (map.find(make_kmer(0xfffffff0ULL), ignored))
-        {
-            std::cerr << "missing key should not be found\n";
-            return false;
-        }
-        return true;
+        return expect_not_found(map, make_kmer(0xfffffff0ULL), "missing key");
     }
 
     bool test_concurrent_insert()
@@ -143,7 +165,7 @@ namespace
         constexpr uint64_t keys_per_thread = 256;
         constexpr uint64_t total_keys = thread_count * keys_per_thread;
 
-        FlatConcurrentHashMap<kWords> map(total_keys);
+        FlatConcurrentHashMap<kWords> map(total_keys, thread_count);
         std::vector<Kmer> keys;
         keys.reserve(total_keys);
         for (uint64_t i = 0; i < total_keys; ++i)
@@ -183,13 +205,6 @@ namespace
             std::cerr << "concurrent insert reported failure\n";
             return false;
         }
-        if (map.size() != total_keys)
-        {
-            std::cerr << "concurrent size mismatch: expected " << total_keys
-                << ", got " << map.size() << "\n";
-            return false;
-        }
-
         map.seal();
 
         for (uint64_t i = 0; i < total_keys; i += 97)
@@ -339,11 +354,14 @@ namespace
 
             const Map map(expected_unique);
             const uint64_t capacity = map.capacity();
-            const uint64_t ctrl_bytes = capacity + Map::GROUP_SIZE - 1;
-            const uint64_t entries_offset = (64 % alignof(Map::Entry) == 0) ? test_round_up(ctrl_bytes, 64) : test_round_up(ctrl_bytes, alignof(Map::Entry));
-            const uint64_t entries_bytes = capacity * sizeof(Map::Entry);
-            const uint64_t payload_bytes = entries_offset + entries_bytes;
-            const uint64_t expected_mmap_bytes = test_round_up(payload_bytes, huge_page_bytes);
+            const uint64_t ctrl_payload_bytes = capacity + Map::GROUP_SIZE - 1;
+            const uint64_t kmer_payload_bytes = capacity * sizeof(kmer<kWords>);
+            const uint64_t count_payload_bytes = capacity * sizeof(uint32_t);
+            const uint64_t payload_bytes = ctrl_payload_bytes + kmer_payload_bytes + count_payload_bytes;
+            const uint64_t expected_mmap_bytes =
+                test_round_up(ctrl_payload_bytes, huge_page_bytes) +
+                test_round_up(kmer_payload_bytes, huge_page_bytes) +
+                test_round_up(count_payload_bytes, huge_page_bytes);
 
             if (mmap_bytes < payload_bytes)
             {

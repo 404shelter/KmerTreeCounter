@@ -14,6 +14,7 @@
 #include "ConcurrentCountingHashMap.h"
 #include "RingMemoryPool.h"
 #include "CountingHashMap.h"
+#include "../sort/ExportRecordRadixSort.h"
 
 #include <atomic>
 #include <vector>
@@ -57,7 +58,7 @@ class KmerTree
     static constexpr int WRITER_WAITING_MAX_BACKOFF = 64;
     static constexpr int WRITER_WAITING_SPIN_TIME = 256;
 
-    
+
 
     struct DrainFrame
     {
@@ -1250,8 +1251,11 @@ private:
 
     void export_hash_map(FinalDrainWriter& writer, ConcurrentMap<N>* hash_map)
     {
-        std::vector<ExportRecord<N>> records;
-        records.reserve(65536); // 预估每个哈希桶的平均记录数，实际可能更少
+        thread_local std::vector<ExportRecord<N>> records;
+        records.clear();
+        records.reserve(kmer_concurrent_hash_map_capacity); // 预估每个哈希桶的平均记录数，实际可能更少
+
+
         for (uint64_t i = 0; i < kmer_concurrent_hash_map_capacity; i++)
         {
             auto node_ptr = hash_map->bucket_head(i).load(std::memory_order_relaxed);
@@ -1263,11 +1267,24 @@ private:
         }
         if (records.empty()) return;
 
-        std::sort(records.begin(), records.end(),
-            [](const ExportRecord<N>& a, const ExportRecord<N>& b) { return a.key < b.key; });
+        // std::sort(records.begin(), records.end(),
+        //     [](const ExportRecord<N>& a, const ExportRecord<N>& b) { return a.key < b.key; });
+        thread_local std::vector<ExportRecord<N>> temp_records;
+        temp_records.resize(records.size());
+        auto res = export_record_radix_sort(records.data(), temp_records.data(), records.size(), k_length);
 
-        for (auto& rec : records)
-            append_export_record(writer, rec.key, rec.count);
+        if (res == records.data())
+        {
+            for (auto& rec : records)
+                append_export_record(writer, rec.key, rec.count);
+        }
+        else
+        {
+            for (auto& rec : temp_records)
+                append_export_record(writer, rec.key, rec.count);
+        }
+        // for (auto& rec : records)
+        //     append_export_record(writer, rec.key, rec.count);
     }
 
     void ensure_spare_block()

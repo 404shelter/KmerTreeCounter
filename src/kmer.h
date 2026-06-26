@@ -12,7 +12,7 @@ template <uint32_t N>
 struct kmer
 {
     std::array<uint64_t, N> data;
-    // 前面的碱基放在data[0]，并且优先填满data[0]
+    // 前面的碱基放在data[0]，并且优先填满data[0]，前面碱基放在高位，后面碱基放在低位（即左对齐）。例如 k=31 时，62 位有效数据在 data[0] 的高 62 位，剩余 2 位为 0；k=32 时，64 位有效数据占满 data[0]，data[1] 全为 0；k=33 时，data[0] 全为有效数据，data[1] 的高 2 位为有效数据，剩余 62 位为 0；以此类推。
 
     kmer() = default;
     kmer &operator=(const kmer<N> &a) = default;

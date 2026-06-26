@@ -12,7 +12,7 @@ enable_testing()
 
 
 
-set(CMAKE_CXX_FLAGS_DEBUG "-O3 -fomit-frame-pointer -mno-omit-leaf-frame-pointer -g -march=native -flto=auto -fdiagnostics-color=always -Wpedantic -Wall -Wextra")
+set(CMAKE_CXX_FLAGS_DEBUG "-O3 -fomit-frame-pointer -g -march=native -flto=auto -fdiagnostics-color=always -Wpedantic -Wall -Wextra")
 set(CMAKE_CXX_FLAGS_RELEASE "-O3 -fomit-frame-pointer -DNDEBUG -march=native -flto=auto -fdiagnostics-color=always -Wpedantic -Wall -Wextra")
 
 
@@ -90,6 +90,10 @@ if(HAVE_NUMA_H)
 endif()
 add_test(NAME HistogramToolTest COMMAND histogram_tool_test $<TARGET_FILE:histogram_tool>)
 
+add_executable(low_frequency_query_thread_pool_test tests/test_low_frequency_query_thread_pool.cpp)
+target_link_libraries(low_frequency_query_thread_pool_test pthread)
+add_test(NAME LowFrequencyQueryThreadPoolTest COMMAND low_frequency_query_thread_pool_test)
+
 add_executable(flat_concurrent_hash_map_avx2_test tests/test_flat_concurrent_hash_map.cpp)
 target_compile_options(flat_concurrent_hash_map_avx2_test PRIVATE -mavx2)
 target_link_libraries(flat_concurrent_hash_map_avx2_test pthread)
@@ -104,3 +108,13 @@ add_executable(flat_concurrent_hash_map_scalar_test tests/test_flat_concurrent_h
 target_compile_options(flat_concurrent_hash_map_scalar_test PRIVATE -mno-avx2 -mno-sse4.2)
 target_link_libraries(flat_concurrent_hash_map_scalar_test pthread)
 add_test(NAME FlatConcurrentHashMapScalarTest COMMAND flat_concurrent_hash_map_scalar_test)
+
+add_executable(benchmark_final_drain_reader_test tests/benchmark_final_drain_reader.cpp)
+target_link_libraries(benchmark_final_drain_reader_test pthread)
+target_link_libraries(benchmark_final_drain_reader_test rt)
+
+add_executable(benchmark_export_reader_test tests/benchmark_export_reader.cpp)
+target_link_libraries(benchmark_export_reader_test pthread)
+target_link_libraries(benchmark_export_reader_test rt)
+
+add_executable(test_and_benckmark_export_record_radix_sort tests/test_and_benckmark_export_record_radix_sort.cpp)

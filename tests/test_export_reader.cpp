@@ -3,7 +3,9 @@
 #include <bit>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <vector>
 
@@ -47,6 +49,14 @@ namespace
         return expected;
     }
 
+    uint64_t packed_kmer_bytes_for_k(uint32_t k)
+    {
+        const uint64_t full_data_count = k / BASES_PER_U64T;
+        const uint64_t tail_bits = 2 * (k % BASES_PER_U64T);
+        const uint64_t tail_bytes = (tail_bits + 7) / 8;
+        return full_data_count * sizeof(uint64_t) + tail_bytes;
+    }
+
     void set_test_temp_dir(const std::string& name)
     {
         const std::filesystem::path dir = std::filesystem::current_path() / name;
@@ -85,6 +95,14 @@ namespace
         writer.join();
     }
 
+    std::vector<char> read_low_bin_bytes()
+    {
+        std::ifstream input(temp_dir + "low.bin", std::ios::binary);
+        return std::vector<char>(
+            std::istreambuf_iterator<char>(input),
+            std::istreambuf_iterator<char>());
+    }
+
     bool expect_equal(const Kmer& actual, const Kmer& expected, const char* label)
     {
         if (actual == expected)
@@ -100,6 +118,60 @@ namespace
         return false;
     }
 
+    bool expect_packed_reader_matches_file(
+        uint32_t k,
+        const std::vector<size_t>& request_sizes,
+        const char* label)
+    {
+        const std::vector<char> expected = read_low_bin_bytes();
+        const uint64_t packed_kmer_bytes = packed_kmer_bytes_for_k(k);
+        if (expected.size() % packed_kmer_bytes != 0)
+        {
+            std::cerr << label << " expected byte size is not k-mer aligned\n";
+            return false;
+        }
+
+        ExportReader<kWords> reader(k);
+        reader.open(temp_dir + "low.bin");
+
+        std::vector<char> actual(expected.size());
+        uint64_t total_read = 0;
+        size_t request_index = 0;
+        while (!reader.finished())
+        {
+            const size_t request_size = request_sizes[request_index++ % request_sizes.size()];
+            const uint64_t got = reader.read_packed_kmers(
+                actual.data() + total_read * packed_kmer_bytes,
+                request_size);
+            if (got == 0)
+            {
+                std::cerr << label << " packed read returned 0 before finished\n";
+                return false;
+            }
+            total_read += got;
+        }
+
+        if (total_read * packed_kmer_bytes != expected.size())
+        {
+            std::cerr << label << " packed delivered byte count mismatch\n";
+            return false;
+        }
+
+        char eof_check = 0;
+        if (reader.read_packed_kmers(&eof_check, 1) != 0)
+        {
+            std::cerr << label << " packed EOF read should return 0\n";
+            return false;
+        }
+
+        if (actual != expected)
+        {
+            std::cerr << label << " packed bytes mismatch\n";
+            return false;
+        }
+        return true;
+    }
+
     bool test_k33()
     {
         constexpr uint32_t k = 33;
@@ -112,7 +184,7 @@ namespace
         write_low_bin(k, input, "tmp_export_reader_k33");
 
         ExportReader<kWords> reader(k);
-        reader.open();
+        reader.open(temp_dir + "low.bin");
         if (reader.finished())
         {
             std::cerr << "k=33 should not be finished after opening non-empty low.bin\n";
@@ -163,7 +235,7 @@ namespace
                 return false;
             }
         }
-        return true;
+        return expect_packed_reader_matches_file(k, {1, 2}, "k=33");
     }
 
     bool test_k64()
@@ -177,7 +249,7 @@ namespace
         write_low_bin(k, input, "tmp_export_reader_k64");
 
         ExportReader<kWords> reader(k);
-        reader.open();
+        reader.open(temp_dir + "low.bin");
         if (reader.finished())
         {
             std::cerr << "k=64 should not be finished after opening non-empty low.bin\n";
@@ -213,7 +285,7 @@ namespace
                 return false;
             }
         }
-        return true;
+        return expect_packed_reader_matches_file(k, {1, 3}, "k=64");
     }
 
     bool test_empty_low_bin()
@@ -222,7 +294,7 @@ namespace
         write_low_bin(k, {}, "tmp_export_reader_empty");
 
         ExportReader<kWords> reader(k);
-        reader.open();
+        reader.open(temp_dir + "low.bin");
         if (!reader.finished())
         {
             std::cerr << "empty low.bin should be finished after open\n";
@@ -240,7 +312,7 @@ namespace
             std::cerr << "empty low.bin read should return 0\n";
             return false;
         }
-        return true;
+        return expect_packed_reader_matches_file(k, {1}, "empty low.bin");
     }
 
     bool test_cross_buffer_reads()
@@ -259,7 +331,7 @@ namespace
         write_low_bin(k, input, "tmp_export_reader_cross_buffer");
 
         ExportReader<kWords> reader(k);
-        reader.open();
+        reader.open(temp_dir + "low.bin");
         if (reader.finished())
         {
             std::cerr << "cross-buffer reader should not be finished after opening non-empty low.bin\n";
@@ -314,7 +386,7 @@ namespace
             return false;
         }
 
-        return true;
+        return expect_packed_reader_matches_file(k, request_sizes, "cross-buffer");
     }
 }
 

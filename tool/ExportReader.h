@@ -81,10 +81,8 @@ public:
         close();
     }
 
-    void open()
+    void open(const std::string& filename)
     {
-        const std::string filename = temp_dir + "low.bin";
-
         if (fd >= 0)
         {
             close();
@@ -174,9 +172,65 @@ public:
         return delivered_kmer_count >= kmer_amount;
     }
 
+    uint64_t read_packed_kmers(char* out_buffer, uint64_t max_kmers_to_read)
+    {
+        {
+            if (finished()) [[unlikely]]
+            {
+                return 0;
+            }
+
+            uint64_t total_read = 0;
+            while (total_read < max_kmers_to_read && !finished())
+            {
+                uint32_t idx = current_buffer_index;
+
+                if (cbs_active[idx]) [[likely]]
+                {
+                    wait_read_finish(idx);
+                    async_read(1 - idx);
+                }
+
+                if (buffer_cursor[idx] >= buffer_kmer_count[idx])
+                {
+                    current_buffer_index = 1 - idx;
+                    continue;
+                }
+
+                const uint64_t available = buffer_kmer_count[idx] - buffer_cursor[idx];
+                if (available == 0) [[unlikely]]
+                {
+                    current_buffer_index = 1 - idx;
+                    continue;
+                }
+
+                const uint64_t to_copy = std::min(max_kmers_to_read - total_read, available);
+                const char* src = buffer[idx] + buffer_cursor[idx] * packed_kmer_bytes;
+                std::memcpy(
+                    out_buffer + total_read * packed_kmer_bytes,
+                    src,
+                    static_cast<size_t>(to_copy * packed_kmer_bytes));
+
+                buffer_cursor[idx] += to_copy;
+                delivered_kmer_count += to_copy;
+                total_read += to_copy;
+
+                if (buffer_cursor[idx] >= buffer_kmer_count[idx])
+                {
+                    buffer_kmer_count[idx] = 0;
+                    buffer_cursor[idx] = 0;
+                    current_buffer_index = 1 - idx;
+                }
+            }
+
+            return total_read;
+        }
+    }
+
+
     uint64_t read_kmers(kmer<N>* out_buffer, uint64_t max_kmers_to_read)
     {
-        if (finished())
+        if (finished()) [[unlikely]]
         {
             return 0;
         }
@@ -186,7 +240,7 @@ public:
         {
             uint32_t idx = current_buffer_index;
 
-            if (cbs_active[idx])
+            if (cbs_active[idx]) [[likely]]
             {
                 wait_read_finish(idx);
                 async_read(1 - idx);
@@ -199,7 +253,7 @@ public:
             }
 
             const uint64_t available = buffer_kmer_count[idx] - buffer_cursor[idx];
-            if (available == 0)
+            if (available == 0) [[unlikely]]
             {
                 current_buffer_index = 1 - idx;
                 continue;
@@ -300,8 +354,8 @@ private:
 
     void unpack_kmers_from_buffer(const char* src, kmer<N>* output, uint64_t count) const
     {
-        std::memset(output, 0, sizeof(kmer<N>) * count);
-        
+        // std::memset(output, 0, sizeof(kmer<N>) * count);
+
         for (uint64_t i = 0; i < count; ++i)
         {
             const char* record = src + i * packed_kmer_bytes;
@@ -315,18 +369,23 @@ private:
             if (tail_bytes > 0)
             {
                 uint64_t tail_data = 0;
-                if constexpr (std::endian::native == std::endian::little)
-                {
-                    std::memcpy(
-                        reinterpret_cast<char*>(&tail_data) + (sizeof(uint64_t) - tail_bytes),
-                        record,
-                        static_cast<size_t>(tail_bytes));
-                }
-                else
-                {
-                    std::memcpy(reinterpret_cast<char*>(&tail_data), record, static_cast<size_t>(tail_bytes));
-                }
+
+                std::memcpy(
+                    reinterpret_cast<char*>(&tail_data) + (sizeof(uint64_t) - tail_bytes),
+                    record,
+                    static_cast<size_t>(tail_bytes));
+
                 output[i].data[full_data_count] = tail_data;
+                for (uint32_t j = full_data_count + 1; j < N; j++)
+                {
+                    output[i].data[j] = 0;
+                }
+            }
+            else {
+                for (uint32_t j = full_data_count; j < N; j++)
+                {
+                    output[i].data[j] = 0;
+                }
             }
         }
     }

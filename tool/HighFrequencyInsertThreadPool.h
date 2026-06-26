@@ -16,6 +16,9 @@ class HighFrequencyInsertThreadPool
 {
     using Record = ExportRecord<N>;
 
+    static constexpr int MAX_SPIN_TIME = 128;
+    static constexpr int MAX_BACKOFF = 256;
+
 public:
     HighFrequencyInsertThreadPool(
         SPMCRingMemoryPool<RING_CAPACITY>* pool,
@@ -115,6 +118,9 @@ private:
         std::vector<int64_t> local_histogram(hist_size_, 0);
         content_type content{};
 
+        int spin_time = 0;
+        int backoff = 2;
+
         while (true)
         {
             if (pool_->consumer_try_dequeue(content))
@@ -122,7 +128,7 @@ private:
                 process_block(content, local_histogram);
                 pool_->consumer_enqueue(content.data);
             }
-            else if (pool_->producer_finished())
+            else if (pool_->producer_finished()) [[unlikely]]
             {
                 while (pool_->consumer_try_dequeue(content))
                 {
@@ -133,7 +139,20 @@ private:
             }
             else
             {
-                cpu_relax();
+                spin_time++;
+                if (spin_time > MAX_SPIN_TIME)
+                {
+                    spin_time = 0;
+                    backoff = 2;
+                    std::this_thread::yield();
+                }
+                else {
+                    for (int i = 0; i < backoff; i++)
+                    {
+                        cpu_relax();
+                    }
+                    backoff = std::min(backoff * 2, MAX_BACKOFF);
+                }
             }
         }
 
@@ -157,7 +176,7 @@ private:
                 continue;
             }
 
-            if (in_range(record.count, min_freq_, max_freq_))
+            if (in_range(record.count, min_freq_, max_freq_)) [[likely]]
             {
                 local_histogram[histogram_index(record.count, min_freq_)] += 1;
             }

@@ -150,7 +150,7 @@ public:
 
     uint64_t read_records(ExportRecord<N>* out_buffer, uint64_t max_records_to_read)
     {
-        if (max_records_to_read == 0 || finished())
+        if (finished()) [[unlikely]]
         {
             return 0;
         }
