@@ -116,7 +116,7 @@ public:
         file_buffer = static_cast<char*>(std::aligned_alloc(4096, chunk_size_));
         if (!file_buffer)
         {
-            std::cerr << "Failed to allocate aligned memory for file buffe9r: " << std::endl;
+            std::cerr << "Failed to allocate aligned memory for file buffer: " << std::endl;
             std::exit(-1);
         }
     }
