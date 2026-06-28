@@ -9,6 +9,7 @@
 #include "ConcurrentMemoryPool.h"
 #include "MPSCRingQueue.h"
 #include "SplitMix.h"
+#include "SpinBackoff.h"
 
 #include <cstring>
 #include <vector>
@@ -32,8 +33,9 @@ template <uint32_t N>
 class FastqParser
 {
     // 自旋参数
-    static constexpr int YIELD_THRESHOLD = 256;
-    static constexpr int MAX_BACKOFF = 64;
+    static constexpr int SLEEP_THRESHOLD = 128;
+    static constexpr int YIELD_THRESHOLD = 64;
+    static constexpr int MAX_BACKOFF = 256;
 
     int k_len;
 
@@ -57,6 +59,9 @@ class FastqParser
     std::array<kmer<N>, PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> kmer_buffer{};
 
     GetKmer<N> get_kmer;
+
+    SpinBackoff<MAX_BACKOFF / 2, YIELD_THRESHOLD * 2, SLEEP_THRESHOLD * 2> enqueue_to_classifier_backoff;
+    SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_from_classifier_backoff;
 
     SplitMix64 rng;
 
@@ -96,8 +101,8 @@ public:
         content_type reader_parser_content;
         bool not_empty = true;
 
-        int backoff_iterations = 1;
-        int spin_count = 0;
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
 
         for (int i = 0; i < classifier_num; i++)
         {
@@ -111,72 +116,47 @@ public:
             not_empty = reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content);
             if (not_empty)
             {
+                // 无等待
 
 #ifdef TEST_MODE
                 not_first_flag = true;
 #endif
 
-                backoff_iterations = 1;
-                spin_count = 0;
+                dequeue_backoff.decay();
 
                 parse(reader_parser_content.data, reader_parser_content.length);
-                // reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
-                while (!reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+
+                if (reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
                 {
+                    // enqueue 无等待
+                    enqueue_backoff.decay();
+                }
+                else
+                {
+                    // enqueue 等待
+                    enqueue_backoff.backoff();
+
+                    while (!reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                    {
+
 #ifdef TEST_MODE
-                    consumer_enqueue_spin_time++;
+                        consumer_enqueue_spin_time++;
 #endif
 
-                    if (spin_count < YIELD_THRESHOLD)
-                    {
-                        // 执行 'backoff_iterations' 次暂停指令
-                        for (int i = 0; i < backoff_iterations; ++i)
-                        {
-                            cpu_relax();
-                        }
-                        // 指数增加退避时间，直到上限
-                        backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                        spin_count++;
-                    }
-                    else
-                    {
-                        // 向操作系统让出：如果我们自旋太久，持锁线程
-                        // 可能已被抢占。让操作系统调度其他线程。
-                        backoff_iterations = 1;
-                        spin_count = 0;
-                        std::this_thread::yield();
+                        enqueue_backoff.backoff();
                     }
                 }
-
-                backoff_iterations = 1;
-                spin_count = 0;
             }
             else
             {
+                //等待
 
 #ifdef TEST_MODE
                 if (not_first_flag)
                     consumer_dequeue_spin_time++;
 #endif
-                if (spin_count < YIELD_THRESHOLD)
-                {
-                    // 执行 'backoff_iterations' 次暂停指令
-                    for (int i = 0; i < backoff_iterations; ++i)
-                    {
-                        cpu_relax();
-                    }
-                    // 指数增加退避时间，直到上限
-                    backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                    spin_count++;
-                }
-                else
-                {
-                    // 向操作系统让出：如果我们自旋太久，持锁线程
-                    // 可能已被抢占。让操作系统调度其他线程。
-                    backoff_iterations = 1;
-                    spin_count = 0;
-                    std::this_thread::yield();
-                }
+                dequeue_backoff.backoff();
+
             }
         }
 
@@ -322,13 +302,13 @@ private:
         }
 
         constexpr uint64_t KMER_BUF_CAP = PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
-        while(ptr < end)
+        while (ptr < end)
         {
             const char c = *ptr;
             ptr++;
             if (get_kmer.get_next_one(c))
             {
-                if(kmer_buffer_count + 1 > KMER_BUF_CAP) [[unlikely]]
+                if (kmer_buffer_count + 1 > KMER_BUF_CAP) [[unlikely]]
                 {
 #ifdef TEST_MODE
                     uint64_t flush_start = __rdtsc();
@@ -342,7 +322,7 @@ private:
                 kmer_buffer[kmer_buffer_count++] = get_kmer.canonical_kmer;
             }
         }
-        
+
 #elif defined(__SSE4_2__)
         // 一次处理16字节
         const char* ptr = data_ptr;
@@ -441,9 +421,9 @@ private:
                     uint64_t flush_end = __rdtsc();
                     flush_cycles += (flush_end - flush_start);
 #endif
-    }
+                }
                 kmer_buffer[kmer_buffer_count++] = get_kmer.canonical_kmer;
-}
+            }
         }
 #else
         for (int i = 0; i < length; ++i)
@@ -572,79 +552,55 @@ private:
     void enqueue_content_to_classifier(const uint32_t owner_id)
     {
 
-        int spin_count = 0;
-        int backoff_iterations = 1;
+        if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
+        {
+            enqueue_to_classifier_backoff.decay();
+            return;
+        }
+
+        enqueue_to_classifier_backoff.backoff();
 
         while (true)
         {
+
 #ifdef TEST_MODE
             producer_enqueue_spin_time++;
 #endif
-            if (spin_count < YIELD_THRESHOLD)
-            {
-                // 执行 'backoff_iterations' 次暂停指令
-                if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
-                {
-                    break;
-                }
-                for (int i = 0; i < backoff_iterations; ++i)
-                {
-                    cpu_relax();
-                }
 
-                if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
-                {
-                    break;
-                }
-                for (int i = 0; i < backoff_iterations; ++i)
-                {
-                    cpu_relax();
-                }
-
-                // 指数增加退避时间，直到上限
-                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                spin_count++;
-            }
-            else
+            if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
             {
-                // 向操作系统让出：如果我们自旋太久，持锁线程
-                // 可能已被抢占。让操作系统调度其他线程。
-                backoff_iterations = 1;
-                spin_count = 0;
-                std::this_thread::yield();
+                break;
             }
+            enqueue_to_classifier_backoff.backoff();
+            if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+            {
+                break;
+            }
+            enqueue_to_classifier_backoff.backoff();
+
         }
     }
 
     void dequeue_data_from_classifier(char*& data)
     {
-        int spin_count = 0;
-        int backoff_iterations = 1;
+
+        if (parser_classifier_ring_pool->producer_try_dequeue(data))
+        {
+            dequeue_from_classifier_backoff.decay();
+            return;
+        }
+
+        dequeue_from_classifier_backoff.backoff();
 
         while (!parser_classifier_ring_pool->producer_try_dequeue(data))
         {
+
 #ifdef TEST_MODE
             producer_dequeue_spin_time++;
 #endif
-            if (spin_count < YIELD_THRESHOLD)
-            {
-                // 执行 'backoff_iterations' 次暂停指令
-                for (int i = 0; i < backoff_iterations; ++i)
-                {
-                    cpu_relax();
-                }
-                // 指数增加退避时间，直到上限
-                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                spin_count++;
-            }
-            else
-            {
-                // 向操作系统让出：如果我们自旋太久，持锁线程
-                // 可能已被抢占。让操作系统调度其他线程。
-                backoff_iterations = 1;
-                spin_count = 0;
-                std::this_thread::yield();
-            }
+
+            dequeue_from_classifier_backoff.backoff();
+
         }
     }
 };

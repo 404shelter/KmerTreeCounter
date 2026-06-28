@@ -4,6 +4,7 @@
 #include "definition.h"
 #include "RingMemoryPool.h"
 #include "kmer.h"
+#include "SpinBackoff.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -403,8 +404,7 @@ private:
         buffer[0] = new char[RAW_BUFFER_SIZE]();
         buffer[1] = new char[RAW_BUFFER_SIZE]();
 
-        int spin_time = 0;
-        int backoff = 1;
+        SpinBackoff backoff;
 
         char* block_ptr = nullptr;
 
@@ -417,8 +417,8 @@ private:
         {
             if (ring_memory_pool->consumer_try_dequeue(content))
             {
+                backoff.decay();
                 block_ptr = content.data;
-
                 ExportBlock<N>* export_kmer_block = reinterpret_cast<ExportBlock<N> *>(block_ptr);
                 if (content.length > 0) [[likely]]
                 {
@@ -443,27 +443,13 @@ private:
                     else {
                         ring_memory_pool->consumer_enqueue(block_ptr);
                     }
-                    // ring_memory_pool->consumer_enqueue(block_ptr);
+                    cpu_relax();
                 }
                 break;
             }
             else
             {
-                spin_time++;
-                if (spin_time >= MAX_SPIN_TIME)
-                {
-                    std::this_thread::yield();
-                    spin_time = 0;
-                    backoff = 4;
-                }
-                else
-                {
-                    for (int i = 0; i < backoff; i++)
-                    {
-                        cpu_relax();
-                    }
-                    backoff = std::min(backoff * 2, MAX_BACKOFF);
-                }
+                backoff.backoff();
             }
         }
 
