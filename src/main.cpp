@@ -27,6 +27,7 @@
 #include <functional>
 #include <bitset>
 #include <atomic>
+#include <algorithm>
 
 uint32_t k_len;        // k-mer 的长度 (例如: 31, 41)
 uint32_t n_thread;     // 允许使用的总线程数

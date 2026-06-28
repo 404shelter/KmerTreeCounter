@@ -9,6 +9,7 @@
 #include "SplitMix.h"
 #include "MPSCRingQueue.h"
 #include "ConcurrentMemoryPool.h"
+#include "SpinBackoff.h"
 
 #include <array>
 #include <cstdint>
@@ -22,8 +23,9 @@ class FastqClassifier
 {
 
     // 自旋参数
-    static constexpr int YIELD_THRESHOLD = 256;
-    static constexpr int MAX_BACKOFF = 64;
+    static constexpr int SLEEP_THRESHOLD = 128;
+    static constexpr int YIELD_THRESHOLD = 64;
+    static constexpr int MAX_BACKOFF = 256;
 
     static constexpr uint64_t EXPORT_KMER_BLOCK_CAPACITY = EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>);
     static constexpr uint32_t BLOOM_PREFETCH_DISTANCE = 8; // 预取 Bloom Filter 的距离（单位：k-mer数量）
@@ -47,6 +49,9 @@ class FastqClassifier
 
     ExportBlock<N>* export_block_ptr = nullptr;
     uint64_t export_kmer_block_count = 0;
+
+    SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_to_export_writer_backoff;
+    SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_from_export_writer_backoff;
 
     std::vector<ConcurrentBloomFilter<N>> local_bloom_filters;
 
@@ -116,8 +121,8 @@ public:
         content_type content;
         bool not_empty = true;
 
-        int backoff_iterations = 1;
-        int spin_count = 0;
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
 
         while (not_empty || !parser_classifier_ring_pool->producer_finished())
         {
@@ -134,6 +139,9 @@ public:
                 not_first_flag = true;
 #endif
 
+                dequeue_backoff.decay();
+
+
                 kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
                 const uint64_t kmer_count = content.length; // length 就是 k-mer数量
                 if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likelyF]]
@@ -145,34 +153,26 @@ public:
                 }
 
 
-                backoff_iterations = 1;
-                spin_count = 0;
 
-                while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
+                if (parser_classifier_ring_pool->consumer_try_enqueue(content.data))
                 {
+                    // 无等待
+                    enqueue_backoff.decay();
+                }
+                else
+                {
+                    // 自旋等待
+                    enqueue_backoff.decay();
+
+                    while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
+                    {
 #ifdef TEST_MODE
-                    consumer_enqueue_spin_time++;
+                        consumer_enqueue_spin_time++;
 #endif
-                    if (spin_count < YIELD_THRESHOLD)
-                    {
-                        for (int i = 0; i < backoff_iterations; ++i)
-                        {
-                            cpu_relax();
-                        }
-                        backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                        spin_count++;
-                    }
-                    else
-                    {
-                        backoff_iterations = 1;
-                        spin_count = 0;
-                        std::this_thread::yield();
+                        enqueue_backoff.backoff();
                     }
                 }
 
-                // parser_classifier_ring_pool->consumer_enqueue(content.data);
-                backoff_iterations = 1;
-                spin_count = 0;
             }
             else
             {
@@ -181,25 +181,7 @@ public:
                     consumer_dequeue_spin_time++;
 #endif
 
-                if (spin_count < YIELD_THRESHOLD)
-                {
-                    // 执行 'backoff_iterations' 次暂停指令
-                    for (int i = 0; i < backoff_iterations; ++i)
-                    {
-                        cpu_relax();
-                    }
-                    // 指数增加退避时间，直到上限
-                    backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                    spin_count++;
-                }
-                else
-                {
-                    // 向操作系统让出：如果我们自旋太久，持锁线程
-                    // 可能已被抢占。让操作系统调度其他线程。
-                    backoff_iterations = 1;
-                    spin_count = 0;
-                    std::this_thread::yield();
-                }
+                dequeue_backoff.backoff();
             }
         }
 
@@ -508,8 +490,12 @@ private:
     void enqueue_content_to_export_writer(const content_type& content)
     {
         RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* export_pool = tree->get_export_ring_pool();
-        int backoff_iterations = 1;
-        int spin_count = 0;
+
+        if (export_pool->producer_try_enqueue(content))
+        {
+            enqueue_to_export_writer_backoff.decay();
+            return;
+        }
 
         while (!export_pool->producer_try_enqueue(content))
         {
@@ -517,31 +503,19 @@ private:
 #ifdef TEST_MODE
             producer_enqueue_spin_time++;
 #endif
-            if (spin_count < YIELD_THRESHOLD)
-            {
-                for (int i = 0; i < backoff_iterations; ++i)
-                {
-                    cpu_relax();
-                }
-                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                spin_count++;
-            }
-            else
-            {
-                // 向操作系统让出：如果我们自旋太久，持锁线程
-                // 可能已被抢占。让操作系统调度其他线程。
-                backoff_iterations = 1;
-                spin_count = 0;
-                std::this_thread::yield();
-            }
+            enqueue_to_export_writer_backoff.backoff();
         }
     }
 
     void dequeue_data_to_export_writer(char*& data)
     {
         RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* export_pool = tree->get_export_ring_pool();
-        int backoff_iterations = 1;
-        int spin_count = 0;
+
+        if (export_pool->producer_try_dequeue(data))
+        {
+            dequeue_from_export_writer_backoff.decay();
+            return;
+        }
 
         while (!export_pool->producer_try_dequeue(data))
         {
@@ -549,23 +523,7 @@ private:
 #ifdef TEST_MODE
             producer_dequeue_spin_time++;
 #endif
-            if (spin_count < YIELD_THRESHOLD)
-            {
-                for (int i = 0; i < backoff_iterations; ++i)
-                {
-                    cpu_relax();
-                }
-                backoff_iterations = std::min(backoff_iterations * 2, MAX_BACKOFF);
-                spin_count++;
-            }
-            else
-            {
-                // 向操作系统让出：如果我们自旋太久，持锁线程
-                // 可能已被抢占。让操作系统调度其他线程。
-                backoff_iterations = 1;
-                spin_count = 0;
-                std::this_thread::yield();
-            }
+            dequeue_from_export_writer_backoff.backoff();
         }
     }
 };
