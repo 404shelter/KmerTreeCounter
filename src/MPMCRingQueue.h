@@ -40,7 +40,7 @@ public:
 	{
 		for (size_t i = 0; i < Capacity; ++i)
 		{
-			buffer[i].sequence.store(i, std::memory_order_relaxed);
+			buffer[i].sequence.store(i);
 		}
 	}
 

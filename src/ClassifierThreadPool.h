@@ -44,6 +44,8 @@ public:
     std::atomic<uint64_t> producer_dequeue_spin_time{ 0 };
     std::atomic<uint64_t> consumer_enqueue_spin_time{ 0 };
     std::atomic<uint64_t> consumer_dequeue_spin_time{ 0 };
+    std::atomic<uint64_t> total_kmers_exported{ 0 };
+    std::atomic<uint64_t> total_kmers_send_to_tree{ 0 };
 #endif
 
     explicit ClassifierThreadPool(const int in_k, KmerTree<N>* tree_ptr,
@@ -85,7 +87,8 @@ public:
                     consumer_dequeue_spin_time.fetch_add(classifier.consumer_dequeue_spin_time, std::memory_order_relaxed);
                     producer_enqueue_spin_time.fetch_add(classifier.producer_enqueue_spin_time, std::memory_order_relaxed);
                     producer_dequeue_spin_time.fetch_add(classifier.producer_dequeue_spin_time, std::memory_order_relaxed);
-
+                    total_kmers_exported.fetch_add(classifier.total_kmers_exported, std::memory_order_relaxed);
+                    total_kmers_send_to_tree.fetch_add(classifier.total_kmers_send_to_tree, std::memory_order_relaxed);
 #endif
                 }));
         }

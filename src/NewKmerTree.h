@@ -90,13 +90,17 @@ class KmerTree
     // 本地任务缓存栈，避免频繁向全局队列 push/pop
     static inline thread_local std::vector<Task<N>> thread_local_task_stack;
     static inline thread_local std::vector<ExportRecord<N>> thread_local_export_buffer;
-    static inline thread_local CountingHashMap<N> thread_local_counting_has_map;
+    static inline thread_local CountingHashMap<N> thread_local_counting_hash_map;
     // 提前分配的spare block
     static inline thread_local char* thread_local_spare_block = nullptr;
 
 public:
     // 根节点数组，2^(2 * ROOT_BASES) 个，每个对应一种短前缀
     node<N>* root_nodes;
+
+#ifdef TEST_MODE
+    alignas(CACHE_LINE_SIZE) std::atomic<long long> total_kmers_added{ 0 };
+#endif
 
     // 构造函数：初始化字典树相关组件
     explicit KmerTree(uint32_t k_len, ConcurrentMemoryPool* in_memory_pool, LayerQueues<N>* in_layer_queue, RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* in_export_ring_pool)
@@ -189,7 +193,7 @@ public:
     {
 
         Task<N> task{};
-        constexpr uint32_t capacity = get_block_capacity();
+        constexpr size_t capacity = get_block_capacity();
         constexpr uint64_t mod = (1ULL << (2 * ROOT_BASES)) - 1;
 
         auto queue_ptr = layer_queue_->get_queue(0);
@@ -344,6 +348,10 @@ public:
             read_offset += first_copy_this_time;
             active_block->count += first_copy_this_time;
 
+#ifdef TEST_MODE
+            total_kmers_added.fetch_add(first_copy_this_time, std::memory_order_relaxed);
+#endif
+
             while (remaining > 0)
             {
                 const uint64_t copy_this_time = (capacity < remaining) ? capacity : remaining;
@@ -375,6 +383,10 @@ public:
                 active_block->count = copy_this_time;
 
                 read_offset += copy_this_time;
+
+#ifdef TEST_MODE
+                total_kmers_added.fetch_add(copy_this_time, std::memory_order_relaxed);
+#endif
             }
         }
     }
@@ -403,15 +415,21 @@ public:
         }
     }
 
-    void check_and_deal_with_local_stack()
+    size_t get_local_task_stack_size() const
     {
+        return thread_local_task_stack.size();
+    }
 
+    bool check_and_deal_with_local_stack()
+    {
+        bool res = thread_local_task_stack.size() > 0;
         while (!thread_local_task_stack.empty())
         {
             Task<N> task = thread_local_task_stack.back();
             thread_local_task_stack.pop_back();
             thread_add_kmer(task);
         }
+        return res;
     }
 
     void mark_finish_export()
@@ -871,19 +889,29 @@ private:
 
     void insert_kmer_in_task_to_hash_map(const Task<N>& current_task)
     {
-        ConcurrentCountingHashMap<N>* hash_map = ensure_hash_map(current_task.current_node);
+        node<N>* parent = current_task.current_node;
+        ConcurrentMap<N>* hash_map = ensure_hash_map(parent);
+
+        uint64_t local_size_count = 0;
+
         for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
         {
             kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
 
             for (uint64_t i = 0; i < input_kmer_block->count; ++i)
             {
-                const kmer<N>& val = input_kmer_block->k_mers[i];
-
-                hash_map->increment(val);
+                // if (!thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i])) [[unlikely]]
+                // {
+                //     flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+                //     thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i]);
+                // }
+                hash_map->increment(input_kmer_block->k_mers[i], local_size_count, 1);
             }
             memory_pool->deallocate(input_kmer_block);
         }
+
+        // flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+        hash_map->add_size(local_size_count);
     }
 
     void flush_part_of_block_to_child(node<N>* child_node, const uint64_t prefix, const uint64_t in_block_for_copy_offset, const uint32_t current_depth)
@@ -1044,9 +1072,9 @@ private:
 
     void flush_local_counting_hash_map_to_hash_map(ConcurrentMap<N>* hash_map, uint64_t& local_size_count)
     {
-        thread_local_counting_has_map.for_each([&](const kmer<N>& kmer_key, const uint32_t count)
+        thread_local_counting_hash_map.for_each([&](const kmer<N>& kmer_key, const uint32_t count)
             { hash_map->increment(kmer_key, local_size_count, count); });
-        thread_local_counting_has_map.clear();
+        thread_local_counting_hash_map.clear();
     }
 
     node<N>* ensure_child_slab(node<N>* parent)

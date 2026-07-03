@@ -65,17 +65,17 @@ public:
 
     void increase_size()
     {
-        size_.fetch_add(1, std::memory_order_relaxed);
+        size_.fetch_add(1, std::memory_order_release);
     }
 
     void decrease_size()
     {
-        size_.fetch_sub(1, std::memory_order_relaxed);
+        size_.fetch_sub(1, std::memory_order_release);
     }
 
     long long size() const
     {
-        return size_.load(std::memory_order_relaxed);
+        return size_.load(std::memory_order_acquire);
     }
 };
 
