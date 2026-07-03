@@ -264,7 +264,7 @@ private:
     };
 
     // 归还节点到线程本地 handle
-    inline void release_node(concurrent_node<N> *node) const noexcept
+    inline void release_node(concurrent_node<N> *node) noexcept
     {
         // 单槽位回收：CAS 竞争失败时暂存，供下次分配复用
         if (waste_slot_ == nullptr)

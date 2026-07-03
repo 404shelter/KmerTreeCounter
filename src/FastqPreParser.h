@@ -7,6 +7,7 @@
 #include "NewKmerTree.h"
 #include "RingMemoryPool.h"
 #include "ConcurrentMemoryPool.h"
+#include "SpinBackoff.h"
 
 #include <cstring>
 #include <vector>
@@ -21,9 +22,6 @@
 template <uint32_t N>
 class FastqPreParser
 {
-    // 自旋参数
-    static constexpr int YIELD_THRESHOLD = 256;
-    static constexpr int MAX_BACKOFF = 64;
 
     int k_len;
 
@@ -40,6 +38,9 @@ class FastqPreParser
 
     content_type parser_classifier_content;
     uint64_t content_kmer_count = 0;
+
+    SpinBackoff<> enqueue_to_classifier_backoff;
+    SpinBackoff<> dequeue_from_classifier_backoff;
 
 public:
 #ifdef TEST_MODE
@@ -59,15 +60,75 @@ public:
     void parse_and_push()
     {
         content_type reader_parser_content;
-        bool not_empty = true;
-
-        int backoff_iterations = 1;
-        int spin_count = 0;
+       
+        SpinBackoff<> enqueue_backoff;
+        SpinBackoff<> dequeue_backoff;
 
         dequeue_data_from_classifier(parser_classifier_content.data);
         content_kmer_count = 0;
 
+        while (true)
+        {
+            if (!reader_parser_ring_pool->producer_finished()) [[likely]]
+            {
+                if (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
+                {
+
+#ifdef TEST_MODE
+                    not_first_flag = true;
+#endif
+
+                    dequeue_backoff.decay();
+
+                    parse(reader_parser_content.data, reader_parser_content.length);
+
+                    if (reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                    {
+                        // enqueue 无等待
+                        enqueue_backoff.decay();
+                    }
+                    else
+                    {
+                        // enqueue 等待
+                        enqueue_backoff.backoff();
+
+                        while (!reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                        {
+
+#ifdef TEST_MODE
+                            consumer_enqueue_spin_time++;
+#endif
+
+                            enqueue_backoff.backoff();
+                        }
+                    }
+                }
+                else
+                {
+
+#ifdef TEST_MODE
+                    if (not_first_flag)
+                        consumer_dequeue_spin_time++;
+#endif
+
+                    dequeue_backoff.backoff();
+                }
+            }
+            else
+            {
+                while (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
+                {
+                    parse(reader_parser_content.data, reader_parser_content.length);
+                    reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
+                }
+                break;
+            }
+        }
+
+        // above is new
+
         // 当队列确实为空且生产者已结束时才退出循环
+        /*
         while (not_empty || !reader_parser_ring_pool->producer_finished())
         {
             not_empty = reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content);
@@ -140,7 +201,7 @@ public:
                     std::this_thread::yield();
                 }
             }
-        }
+        }*/
 
         parser_classifier_content.length = content_kmer_count;
         enqueue_content_to_classifier(parser_classifier_content);
@@ -461,12 +522,35 @@ private:
     void enqueue_content_to_classifier(const content_type& content)
     {
 
+        if (parser_classifier_ring_pool->producer_try_enqueue(content))
+        {
+            enqueue_to_classifier_backoff.decay();
+            return;
+        }
+
+        enqueue_to_classifier_backoff.backoff();
+
+        while (true)
+        {
+
+#ifdef TEST_MODE
+            producer_enqueue_spin_time++;
+#endif
+
+            if (parser_classifier_ring_pool->producer_try_enqueue(content))
+            {
+                break;
+            }
+            enqueue_to_classifier_backoff.backoff();
+
+        }
+
         // calculate_block_prefix_counts(reinterpret_cast<kmer<N> *>(content.data), content.length);
         // push_kmers_into_local_block_for_copy(reinterpret_cast<kmer<N> *>(content.data), content.length);
 
         // std::memcpy(content.data, local_block_for_copy.data(), content.length * sizeof(kmer<N>));
 
-        int spin_count = 0;
+        /*int spin_count = 0;
         int backoff_iterations = 1;
 
         while (!parser_classifier_ring_pool->producer_try_enqueue(content))
@@ -493,11 +577,34 @@ private:
                 spin_count = 0;
                 std::this_thread::yield();
             }
-        }
+        }*/
     }
 
     void dequeue_data_from_classifier(char*& data)
     {
+
+        if (parser_classifier_ring_pool->producer_try_dequeue(data))
+        {
+            dequeue_from_classifier_backoff.decay();
+            return;
+        }
+
+        dequeue_from_classifier_backoff.backoff();
+
+        while (!parser_classifier_ring_pool->producer_try_dequeue(data))
+        {
+
+#ifdef TEST_MODE
+            producer_dequeue_spin_time++;
+#endif
+
+            dequeue_from_classifier_backoff.backoff();
+
+        }
+
+        // above is new
+
+        /*
         int spin_count = 0;
         int backoff_iterations = 1;
 
@@ -525,7 +632,7 @@ private:
                 spin_count = 0;
                 std::this_thread::yield();
             }
-        }
+        }*/
     }
 };
 

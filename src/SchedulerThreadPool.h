@@ -16,6 +16,7 @@
 #include <barrier>
 #include <limits>
 #include <chrono>
+#include <mutex>
 
 constexpr uint64_t TSL_HASH_TABLE_SIZE = 512 * 1024;
 
@@ -31,6 +32,9 @@ class SchedulerThreadPool final
     static constexpr uint32_t MIN_BACKLOG_GATE_DRAINING = 1;
     static constexpr uint32_t PRESSURE_WINDOW_BASE = 16;
     static constexpr uint32_t INVALID_DEPTH = MAX_DEPTH;
+
+    // 调度器睡眠时间
+    static constexpr uint32_t SCHEDULER_SLEEP_NS = 500;
 
     // 以下是调度算法的参数
     static constexpr double SCORE_EMPTY_PENALTY = 0.20;
@@ -67,9 +71,11 @@ class SchedulerThreadPool final
     std::vector<std::atomic<uint32_t>> worker_last_depth;
     std::vector<std::atomic<uint8_t>> worker_is_bound;
     std::vector<std::atomic<uint32_t>> worker_current_depth;
+    std::vector<std::atomic<bool>> worker_alive;
 
     // 测试模式
 #ifdef TEST_MODE
+    std::mutex mtx;
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> switch_success_count{ 0 };
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> force_local_stack_count{ 0 };
     alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> depth_release_count{ 0 };
@@ -79,7 +85,10 @@ class SchedulerThreadPool final
 
 public:
     explicit SchedulerThreadPool(uint32_t worker_count, uint32_t producer_count, KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
-        : worker_count_(worker_count), active_producer(producer_count), tree_ptr_(tree_ptr), layer_queues_ptr_(layer_queues_ptr), worker_queues_(worker_count - 1), worker_last_depth(worker_count - 1), worker_is_bound(worker_count - 1), worker_current_depth(worker_count - 1)
+        : worker_count_(worker_count), active_producer(producer_count), tree_ptr_(tree_ptr),
+        layer_queues_ptr_(layer_queues_ptr), worker_queues_(worker_count - 1),
+        worker_last_depth(worker_count - 1), worker_is_bound(worker_count - 1),
+        worker_current_depth(worker_count - 1), worker_alive(worker_count - 1)
     {
         worker_threads_ptr_.reserve(worker_count_ - 1);
         for (uint32_t i = 0; i + 1 < worker_count_; i++)
@@ -87,6 +96,7 @@ public:
             worker_last_depth[i].store(0, std::memory_order_relaxed);
             worker_is_bound[i].store(0, std::memory_order_relaxed);
             worker_current_depth[i].store(INVALID_DEPTH, std::memory_order_relaxed);
+            worker_alive[i].store(false, std::memory_order_relaxed);
         }
     }
 
@@ -111,6 +121,7 @@ public:
         for (uint32_t i = 0; i + 1 < worker_count_; ++i)
         {
             worker_threads_ptr_.push_back(std::make_unique<std::thread>(&SchedulerThreadPool::worker_thread_loop, this, i));
+            worker_alive[i].store(true, std::memory_order_release);
         }
         scheduler_thread_ = std::thread(&SchedulerThreadPool::scheduler_thread_loop, this);
     }
@@ -258,14 +269,7 @@ private:
 
     bool are_all_depth_queues_empty() const
     {
-        for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth)
-        {
-            if (!layer_queues_ptr_->get_queue(depth)->empty())
-            {
-                return false;
-            }
-        }
-        return true;
+        return layer_queues_ptr_->size() == 0;
     }
 
     void apply_backoff(uint32_t& backoff_iterations, const uint32_t max_backoff, const bool is_wait_depth)
@@ -364,34 +368,37 @@ private:
             context.state = WorkerState::WAIT_DEPTH;
             context.empty_rounds_at_depth = 0;
             context.cannot_switch_count = 0;
+            if (draining_mode) [[unlikely]]
+            {
+                worker_last_depth[worker_id].store(INVALID_DEPTH, std::memory_order_release);
+            }
             return;
         }
 
         apply_backoff(context.bound_backoff_iterations, MAX_BACKOFF_BOUND_DEPTH, false);
     }
 
-    void drain_all_depths_and_local_stack(Task<N>& task)
+    void drain_all_depths_and_local_stack()
     {
+        Task<N> task;
         uint32_t stable_empty_rounds = 0;
         while (stable_empty_rounds < DRAIN_EMPTY_CONFIRM_ROUNDS)
         {
-            bool found_queue_work = false;
-            for (int32_t depth = static_cast<int32_t>(MAX_DEPTH - 1); depth >= 0; --depth)
+            for (int32_t depth = 0; depth < MAX_DEPTH; depth++)
             {
                 auto queue = layer_queues_ptr_->get_queue(static_cast<uint32_t>(depth));
                 while (queue->try_dequeue(task))
                 {
                     layer_queues_ptr_->decrease_size();
                     tree_ptr_->thread_add_kmer(task);
-                    found_queue_work = true;
                 }
             }
 
-            tree_ptr_->check_and_deal_with_local_stack();
+            bool found_local_task_work = tree_ptr_->check_and_deal_with_local_stack();
 
-            if (!found_queue_work && are_all_depth_queues_empty())
+            if (!found_local_task_work && are_all_depth_queues_empty())
             {
-                ++stable_empty_rounds;
+                stable_empty_rounds++;
             }
             else
             {
@@ -406,7 +413,7 @@ private:
         bool draining_mode = active_producer.load(std::memory_order_acquire) == 0;
         Task<N> task;
 
-        while (!stop_requested_.load(std::memory_order_relaxed) || layer_queues_ptr_->size() > 0)
+        while (!stop_requested_.load(std::memory_order_relaxed) || !are_all_depth_queues_empty())
         {
             if (!draining_mode && active_producer.load(std::memory_order_acquire) == 0)
             {
@@ -423,9 +430,17 @@ private:
         }
 
         release_depth_if_bound(worker_id, context.current_depth, context.has_depth);
-        drain_all_depths_and_local_stack(task);
+        worker_alive[worker_id].store(false, std::memory_order_release);
+        worker_last_depth[worker_id].store(INVALID_DEPTH, std::memory_order_relaxed);
+        uint32_t discard_depth;
+        while (worker_queues_[worker_id].try_dequeue(discard_depth)) {};
+        drain_all_depths_and_local_stack();
+        std::this_thread::sleep_for(std::chrono::nanoseconds(2 * SCHEDULER_SLEEP_NS));
+        while (worker_queues_[worker_id].try_dequeue(discard_depth)) {};
 
 #ifdef TEST_MODE
+        // std::lock_guard<std::mutex> lock(mtx);
+        // std::cout << "Worker local stack size: " << tree_ptr_->get_local_task_stack_size() << '\n';
         SpinLock::flush_spin_loops_for_current_thread();
 #endif
     }
@@ -500,7 +515,7 @@ private:
         std::array<double, MAX_DEPTH> prev_pressure = { 0.0 };
 
         // 核心监控与调度循环
-        while (!stop_requested_.load(std::memory_order_relaxed) || layer_queues_ptr_->size() > 0)
+        while (!stop_requested_.load(std::memory_order_relaxed) || !are_all_depth_queues_empty())
         {
             std::array<uint32_t, MAX_DEPTH> queue_size;
             std::array<double, MAX_DEPTH> fill_ratio;
@@ -621,6 +636,12 @@ private:
 
             for (uint32_t worker_id = 0; worker_id < available_workers; ++worker_id)
             {
+
+                if (worker_alive[worker_id].load(std::memory_order_acquire) == false)
+                {
+                    continue;
+                }
+
                 if (worker_queues_[worker_id].empty())
                 {
                     continue;
@@ -706,6 +727,11 @@ private:
             uint32_t burst_bypass_budget = std::max<uint32_t>(1, available_workers / 4);
             for (uint32_t worker_id = 0; worker_id < available_workers; worker_id++)
             {
+                if (worker_alive[worker_id].load(std::memory_order_acquire) == false)
+                {
+                    continue;
+                }
+
                 if (worker_is_bound[worker_id].load(std::memory_order_acquire) != 0)
                 {
                     continue;
@@ -743,6 +769,7 @@ private:
                 }
 
                 if (selected_depth != INVALID_DEPTH &&
+                    worker_alive[worker_id].load(std::memory_order_acquire) &&
                     worker_is_bound[worker_id].load(std::memory_order_acquire) == 0 &&
                     worker_queues_[worker_id].empty() &&
                     worker_queues_[worker_id].try_enqueue(selected_depth)) [[likely]]
@@ -795,6 +822,11 @@ private:
 
                     for (uint32_t worker_id = 0; worker_id < available_workers; ++worker_id)
                     {
+                        if (worker_alive[worker_id].load(std::memory_order_acquire) == false)
+                        {
+                            continue;
+                        }
+
                         if (worker_is_bound[worker_id].load(std::memory_order_acquire) == 0)
                         {
                             continue;
@@ -846,7 +878,7 @@ private:
                     }
 
                     const uint32_t donor_id = static_cast<uint32_t>(donor);
-                    if (worker_is_bound[donor_id].load(std::memory_order_acquire) == 0 || !worker_queues_[donor_id].empty())
+                    if (worker_is_bound[donor_id].load(std::memory_order_acquire) == 0 || !worker_queues_[donor_id].empty() || worker_alive[donor_id].load(std::memory_order_acquire) == false)
                     {
                         break;
                     }
@@ -871,7 +903,7 @@ private:
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::nanoseconds(500));
+            std::this_thread::sleep_for(std::chrono::nanoseconds(SCHEDULER_SLEEP_NS));
         }
     }
 };

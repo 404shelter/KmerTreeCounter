@@ -99,7 +99,7 @@ public:
     void parse_and_push()
     {
         content_type reader_parser_content;
-        bool not_empty = true;
+        // bool not_empty = true;
 
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
@@ -110,8 +110,69 @@ public:
             owner_contents[i].length = 0;
         }
 
+
+        while (true)
+        {
+            if (!reader_parser_ring_pool->producer_finished()) [[likely]]
+            {
+                if (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
+                {
+
+#ifdef TEST_MODE
+                    not_first_flag = true;
+#endif
+
+                    dequeue_backoff.decay();
+
+                    parse(reader_parser_content.data, reader_parser_content.length);
+
+                    if (reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                    {
+                        // enqueue 无等待
+                        enqueue_backoff.decay();
+                    }
+                    else
+                    {
+                        // enqueue 等待
+                        enqueue_backoff.backoff();
+
+                        while (!reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                        {
+
+#ifdef TEST_MODE
+                            consumer_enqueue_spin_time++;
+#endif
+
+                            enqueue_backoff.backoff();
+                        }
+                    }
+                }
+                else
+                {
+
+#ifdef TEST_MODE
+                    if (not_first_flag)
+                        consumer_dequeue_spin_time++;
+#endif
+
+                    dequeue_backoff.backoff();
+                }
+            }
+            else
+            {
+                while (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
+                {
+                    parse(reader_parser_content.data, reader_parser_content.length);
+                    reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
+                }
+                break;
+            }
+        }
+
+        // above is new
+
         // 当队列确实为空且生产者已结束时才退出循环
-        while (not_empty || !reader_parser_ring_pool->producer_finished())
+        /*while (not_empty || !reader_parser_ring_pool->producer_finished())
         {
             not_empty = reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content);
             if (not_empty)
@@ -158,7 +219,7 @@ public:
                 dequeue_backoff.backoff();
 
             }
-        }
+        }*/
 
         flush_kmer_buffer();
 

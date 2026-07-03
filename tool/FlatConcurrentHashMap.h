@@ -131,6 +131,7 @@ public:
 
     void seal() noexcept
     {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (uint64_t i = 0; i < GROUP_SIZE - 1; ++i)
         {
             ctrl_[static_cast<size_t>(capacity_ + i)] = ctrl_[static_cast<size_t>(i)];

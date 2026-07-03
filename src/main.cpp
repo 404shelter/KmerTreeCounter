@@ -304,9 +304,20 @@ int process_main()
     std::cout << "Classifier producer enqueue total spin time: " << classifier_thread_pool->producer_enqueue_spin_time.load() << std::endl;
     std::cout << "Classifier producer dequeue total spin time: " << classifier_thread_pool->producer_dequeue_spin_time.load() << std::endl;
 
+    std::cout << "KmerTree total kmers added: " << tree->total_kmers_added.load() << std::endl;
+    std::cout << "Kmer total kmers exported: " << classifier_thread_pool->total_kmers_exported.load() << std::endl;
+    std::cout << "Kmer total kmers sent to tree: " << classifier_thread_pool->total_kmers_send_to_tree.load() << std::endl;
+    std::cout << "equal : " << ((tree->total_kmers_added.load() + classifier_thread_pool->total_kmers_exported.load()) == parser_thread_pool->get_total_read_kmer()) << std::endl;
+
+    for (uint32_t i = 0;i < MAX_DEPTH;i++)
+    {
+        std::cout << "Depth " << i << " queue size: " << layer_queues->get_queue(i)->size() << std::endl;
+    }
+
 #endif
 
     std::cout << "High frequency unique k-mer : " << sorted_kmer_count.load() << std::endl;
+
 
     return 0;
 }
