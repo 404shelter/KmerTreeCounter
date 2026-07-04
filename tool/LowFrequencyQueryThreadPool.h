@@ -2,7 +2,7 @@
 #define LOW_FREQUENCY_QUERY_THREAD_POOL_HEADER
 
 #include "FlatConcurrentHashMap.h"
-
+#include "../src/SpinBackoff.h"
 #include "../src/RingMemoryPool.h"
 
 #include <algorithm>
@@ -14,11 +14,13 @@
 #include <thread>
 #include <vector>
 
+
 template <uint32_t N, uint64_t RING_CAPACITY>
 class LowFrequencyQueryThreadPool
 {
 
-    static constexpr int MAX_SPIN_TIME = 128;
+    static constexpr int SLEEP_THRESHOLD = 128;
+    static constexpr int YIELD_THRESHOLD = 64;
     static constexpr int MAX_BACKOFF = 256;
     static constexpr uint64_t QUERY_PREFETCH_DISTANCE = 8;
 
@@ -151,13 +153,13 @@ private:
         std::vector<int64_t> local_histogram(hist_size_, 0);
         content_type content{};
 
-        int spin_time = 0;
-        int backoff = 2;
+        SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
 
         while (true)
         {
             if (pool_->consumer_try_dequeue(content))
             {
+                dequeue_backoff.decay();
                 process_block(content, local_histogram);
                 pool_->consumer_enqueue(content.data);
             }
@@ -172,20 +174,7 @@ private:
             }
             else
             {
-                spin_time++;
-                if (spin_time > MAX_SPIN_TIME)
-                {
-                    spin_time = 0;
-                    backoff = 2;
-                    std::this_thread::yield();
-                }
-                else {
-                    for (int i = 0; i < backoff; i++)
-                    {
-                        cpu_relax();
-                    }
-                    backoff = std::min(backoff * 2, MAX_BACKOFF);
-                }
+                dequeue_backoff.backoff();
             }
         }
 

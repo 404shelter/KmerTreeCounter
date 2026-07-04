@@ -20,6 +20,7 @@
 #include "FlatConcurrentHashMap.h"
 #include "HighFrequencyInsertThreadPool.h"
 #include "LowFrequencyQueryThreadPool.h"
+#include "ApproximateHighFrequency.h"
 
 #include "../src/RingMemoryPool.h"
 
@@ -33,6 +34,7 @@ namespace
     struct Options
     {
         std::string tmp_dir;
+        bool is_precise = false;
         uint32_t k_len = 0;
         uint32_t max_threads = 0;
         uint64_t max_memory_bytes = 0;
@@ -163,26 +165,40 @@ namespace
 
     [[nodiscard]] Options parse_options(int argc, char* argv[])
     {
-        if (argc < 6 || argc > 8)
+        if (argc < 7 || argc > 9)
         {
-            std::cerr << "Usage: histogram_tool <tmp_dir> <k_len> <max_threads> <max_memory_gb> <output_file> [min_freq=1] [max_freq=10000]"
+            std::cerr << "Usage: histogram_tool <precise/approximate> <tmp_dir> <k_len> <max_threads> <max_memory_gb> <output_file> [min_freq=1] [max_freq=10000]"
                 << std::endl;
             exit(-1);
         }
 
         Options options;
-        options.tmp_dir = with_trailing_slash(argv[1]);
-        options.k_len = parse_u32(argv[2], "k_len");
-        options.max_threads = parse_u32(argv[3], "max_threads");
-        options.max_memory_bytes = parse_memory_gib(argv[4]);
-        options.output_file = argv[5];
-        if (argc >= 7)
+        options.tmp_dir = with_trailing_slash(argv[2]);
+        options.k_len = parse_u32(argv[3], "k_len");
+        options.max_threads = parse_u32(argv[4], "max_threads");
+        options.max_memory_bytes = parse_memory_gib(argv[5]);
+        options.output_file = argv[6];
+
+        if (std::strcmp(argv[1], "precise") == 0)
+         {
+            options.is_precise = true;
+        }
+        else if (std::strcmp(argv[1], "approximate") == 0)
         {
-            options.min_freq = parse_u32(argv[6], "min_freq");
+            options.is_precise = false;
+        }
+        else
+        {
+            std::cerr << "invalid mode: must be 'precise' or 'approximate'" << std::endl;
+            exit(-1);
         }
         if (argc >= 8)
         {
-            options.max_freq = parse_u32(argv[7], "max_freq");
+            options.min_freq = parse_u32(argv[7], "min_freq");
+        }
+        if (argc >= 9)
+        {
+            options.max_freq = parse_u32(argv[8], "max_freq");
         }
 
         if (options.k_len == 0 || options.k_len > MAX_K)
@@ -414,7 +430,8 @@ namespace
         std::ofstream output(output_filename, std::ios::out | std::ios::trunc);
         if (!output)
         {
-            throw std::runtime_error("failed to open output file: " + output_filename);
+            std::cerr << "failed to open output file: " << output_filename << std::endl;
+            exit(1);
         }
 
         for (size_t i = 0; i < histogram.size(); ++i)
@@ -425,7 +442,7 @@ namespace
     }
 
     template <uint32_t N>
-    int run_histogram_tool(const Options& options)
+    int run_precise_histogram_tool(const Options& options)
     {
         temp_dir = options.tmp_dir;
 
@@ -509,32 +526,103 @@ namespace
         return 0;
     }
 
-    int dispatch_by_k_len(const Options& options)
+    int precise_dispatch_by_k_len(const Options& options)
     {
         if (options.k_len <= 32)
         {
-            return run_histogram_tool<1>(options);
+            return run_precise_histogram_tool<1>(options);
         }
         else if (options.k_len <= 64)
         {
-            return run_histogram_tool<2>(options);
+            return run_precise_histogram_tool<2>(options);
         }
         else if (options.k_len <= MAX_K)
         {
-            return run_histogram_tool<4>(options);
+            return run_precise_histogram_tool<4>(options);
         }
         else
         {
             std::cerr << "unsupported k_len: " << options.k_len << '\n';
             exit(-1);
         }
+    }
 
+    template <uint32_t N>
+    int run_approximate_histogram_tool(const Options& options){
+        temp_dir = options.tmp_dir;
+
+        const size_t hist_size = static_cast<size_t>(
+            static_cast<uint64_t>(options.max_freq) - static_cast<uint64_t>(options.min_freq) + 1ULL);
+        const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
+
+        uint64_t expected_unique_insert = 0;
+        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert);
+        uint64_t high_file_bytes = 0;
+        for (const RootFileInfo& root_file : root_files)
+        {
+            high_file_bytes += root_file.file_size;
+        }
+
+        ProgressPrinter progress(high_file_bytes);
+
+        AtomicHistogram global_histogram(hist_size);
+        init_histogram(global_histogram);
+
+        progress.start();
+
+        {
+            SPMCRingMemoryPool<HISTOGRAM_RING_CAPACITY> approximate_pool(HISTOGRAM_BLOCK_BYTES, 1);
+            ApproximateHighFrequencyThreadPool<N, HISTOGRAM_RING_CAPACITY> approximate_threads(
+                &approximate_pool,
+                &global_histogram,
+                worker_count,
+                options.k_len,
+                options.min_freq,
+                options.max_freq,
+                hist_size);
+
+            approximate_threads.start();
+            enqueue_high_records<N>(root_files, approximate_pool, &progress);
+            approximate_threads.join();
+        }
+
+        write_histogram(options.output_file, global_histogram, options.min_freq);
+        progress.finish();
+        return 0;
+    }
+
+    int approximate_dispatch_by_k_len(const Options& options)
+    {
+        if (options.k_len <= 32)
+        {
+            return run_approximate_histogram_tool<1>(options);
+        }
+        else if (options.k_len <= 64)
+        {
+            return run_approximate_histogram_tool<2>(options);
+        }
+        else if (options.k_len <= MAX_K)
+        {
+            return run_approximate_histogram_tool<4>(options);
+        }
+        else
+        {
+            std::cerr << "unsupported k_len: " << options.k_len << '\n';
+            exit(-1);
+        }
     }
 }
 
 int main(int argc, char* argv[])
 {
     const Options options = parse_options(argc, argv);
-    return dispatch_by_k_len(options);
-
+    if(options.is_precise)
+    {
+        return precise_dispatch_by_k_len(options);
+    }
+    else
+    {
+        return approximate_dispatch_by_k_len(options);
+    }
+    return precise_dispatch_by_k_len(options);
 }

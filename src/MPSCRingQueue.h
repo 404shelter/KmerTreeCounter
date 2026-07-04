@@ -2,6 +2,7 @@
 #define MPSC_RING_QUEUE_HEADER
 
 #include "definition.h"
+#include "SpinBackoff.h"
 
 #include <array>
 #include <atomic>
@@ -27,7 +28,7 @@ class MPSCRingQueue
 
 	constexpr static std::size_t mask = Capacity - 1;
 
-	constexpr static int SPIN_LIMIT = 256;
+	constexpr static int SPIN_LIMIT = 1024;
 	constexpr static int BACKOFF_LIMIT = 64;
 
 	alignas(CACHE_LINE_SIZE) std::atomic<std::size_t> enqueue_pos;
@@ -76,32 +77,17 @@ public:
 			}
 
 			// seq > pos: another producer advanced enqueue_pos; retry with fresh pos.
-			pos = enqueue_pos.load(std::memory_order_relaxed);
 			cpu_relax();
+			pos = enqueue_pos.load(std::memory_order_relaxed);
 		}
 	}
 
 	void enqueue(const T& item)
 	{
-		int spin_count = 1;
-		int backoff = 1;
+		SpinBackoff backoff;
 		while (!try_enqueue(item))
 		{
-			if (spin_count >= BACKOFF_LIMIT) [[unlikely]]
-			{
-				std::this_thread::yield();
-				spin_count = 0;
-				backoff = 1;
-			}
-			else
-			{
-				for (int i = 0; i < backoff; ++i)
-				{
-					cpu_relax();
-				}
-				spin_count++;
-				backoff = std::min(backoff * 2, BACKOFF_LIMIT);
-			}
+			backoff.backoff();
 		}
 	}
 
@@ -128,33 +114,18 @@ public:
 			}
 
 			// seq > pos + 1: another producer advanced enqueue_pos; retry with fresh pos.
-			pos = dequeue_pos.load(std::memory_order_relaxed);
 			cpu_relax();
+			pos = dequeue_pos.load(std::memory_order_relaxed);
 		}
 
 	}
 
 	void dequeue(T& item)
 	{
-		int spin_count = 1;
-		int backoff = 1;
+		SpinBackoff backoff;
 		while (!try_dequeue(item))
 		{
-			if (spin_count >= BACKOFF_LIMIT) [[unlikely]]
-			{
-				std::this_thread::yield();
-				spin_count = 0;
-				backoff = 1;
-			}
-			else
-			{
-				for (int i = 0; i < backoff; ++i)
-				{
-					cpu_relax();
-				}
-				spin_count++;
-				backoff = std::min(backoff * 2, BACKOFF_LIMIT);
-			}
+			backoff.backoff();
 		}
 	}
 
