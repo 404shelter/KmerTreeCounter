@@ -4,6 +4,9 @@
 // 并发内存池 - NUMA感知设计
 // 固定块模型（4KB），线程本地缓存，跨线程释放支持
 
+#include "definition.h"
+#include "SpinBackoff.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -28,14 +31,6 @@
 #define HAS_LIBNUMA 1
 #else
 #define HAS_LIBNUMA 0
-#endif
-
-//==============================================================================
-// 自包含的缓存行大小定义
-//==============================================================================
-// 本文件不依赖项目其他头文件，单独定义缓存行大小以避免 include 顺序问题。
-#ifndef CMP_CACHE_LINE_SIZE
-constexpr size_t CMP_CACHE_LINE_SIZE = 64;
 #endif
 
 //==============================================================================
@@ -76,50 +71,6 @@ constexpr bool is_aligned(size_t value, size_t alignment)
     return (value & (alignment - 1)) == 0;
 }
 
-// 轻量级自旋退让：x86 pause / 其他平台 yield
-inline void cpu_relax() noexcept
-{
-#if defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    __asm__ volatile("yield" ::: "memory");
-#else
-    std::this_thread::yield();
-#endif
-}
-
-// 带指数退避的自旋等待，避免高竞争时总线风暴
-class SpinBackoff
-{
-public:
-    explicit SpinBackoff(int max_spin = 16) noexcept
-        : spin_count_(0), max_spin_(max_spin)
-    {
-    }
-
-    void operator()() noexcept
-    {
-        int limit = std::min(1 << spin_count_, max_spin_);
-        for (int i = 0; i < limit; ++i)
-        {
-            cpu_relax();
-        }
-        if (spin_count_ < 8)
-        {
-            ++spin_count_;
-        }
-    }
-
-    void reset() noexcept
-    {
-        spin_count_ = 0;
-    }
-
-private:
-    int spin_count_;
-    int max_spin_;
-};
-
 //==============================================================================
 // FreeBlock - 侵入式链表节点
 //==============================================================================
@@ -137,7 +88,7 @@ struct FreeBlock
 
 // 每个 NUMA 节点一个 Arena，管理本节点的内存块
 // 使用 alignas 避免伪共享
-struct alignas(CMP_CACHE_LINE_SIZE) Arena
+struct alignas(CACHE_LINE_SIZE) Arena
 {
     void* start_addr; // 本 Arena 的起始地址
     void* end_addr;   // 本 Arena 的结束地址（不包含）
@@ -168,15 +119,15 @@ struct alignas(CMP_CACHE_LINE_SIZE) Arena
 
 // 用于 ThreadLocalCache 中的远程链表。
 // 尾部填充至缓存行大小，避免相邻 arena 的 remote list 产生伪共享。
-struct alignas(CMP_CACHE_LINE_SIZE) RemoteListHead
+struct alignas(CACHE_LINE_SIZE) RemoteListHead
 {
     FreeBlock* head;
     size_t count;
-    char padding[CMP_CACHE_LINE_SIZE - sizeof(FreeBlock*) - sizeof(size_t)];
+    char padding[CACHE_LINE_SIZE - sizeof(FreeBlock*) - sizeof(size_t)];
 
     RemoteListHead() : head(nullptr), count(0)
     {
-        static_assert(sizeof(RemoteListHead) == CMP_CACHE_LINE_SIZE,
+        static_assert(sizeof(RemoteListHead) == CACHE_LINE_SIZE,
                       "RemoteListHead must occupy exactly one cache line");
     }
 };
@@ -193,7 +144,7 @@ struct ThreadLocalCache
 
     // 远程链表数组，每个 Arena 一个
     // 用于暂存属于其他 Arena 的块
-    alignas(CMP_CACHE_LINE_SIZE) RemoteListHead remote_lists[MAX_NUMA_NODES];
+    alignas(CACHE_LINE_SIZE) RemoteListHead remote_lists[MAX_NUMA_NODES];
 
     // 指向本地 Arena 的指针
     Arena* local_arena;
@@ -287,7 +238,7 @@ private:
     //--------------------------------------------------------------------------
 
     // Arena 数组
-    alignas(CMP_CACHE_LINE_SIZE) Arena arenas_[MAX_NUMA_NODES];
+    alignas(CACHE_LINE_SIZE) Arena arenas_[MAX_NUMA_NODES];
 
     // 实际使用的 Arena 数量
     int num_arenas_;
@@ -323,13 +274,13 @@ private:
     int numa_distance_order_[MAX_NUMA_NODES][MAX_NUMA_NODES];
 
     // init_arenas 前已分配的大块偏移
-    alignas(CMP_CACHE_LINE_SIZE) std::atomic<size_t> pre_arena_offset_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> pre_arena_offset_{0};
 
     // 保护 pre_arena_offset_ 的互斥锁
     std::mutex pre_arena_mutex_;
 
     // Arena 是否已初始化
-    alignas(CMP_CACHE_LINE_SIZE) std::atomic<bool> arenas_initialized_{false};
+    alignas(CACHE_LINE_SIZE) std::atomic<bool> arenas_initialized_{false};
 
     // 线程本地缓存
     static inline thread_local ThreadLocalCache tls_cache_;
@@ -797,7 +748,9 @@ inline void ConcurrentMemoryPool::perform_first_touch(size_t num_threads)
                 char* start = static_cast<char*>(arenas_[arena_idx].start_addr);
                 for (size_t p = start_page; p < end_page; ++p)
                 {
-                    start[p * page_size_] = 0;
+                    // 只触摸每页的第一个字节，使用 volatile 防止 O3 优化掉
+                    volatile char* vp = start + p * page_size_;
+                    *vp = 0;
                 }
                 });
         }
@@ -839,7 +792,7 @@ inline char* ConcurrentMemoryPool::bump_allocate_from_arena(Arena& arena, size_t
         {
             return cursor;
         }
-        backoff();
+        backoff.backoff();
     }
 }
 
@@ -893,7 +846,7 @@ inline FreeBlock* ConcurrentMemoryPool::batch_allocate_from_bump(Arena& arena, s
             out_count = allocate_blocks;
             return head;
         }
-        backoff();
+        backoff.backoff();
     }
 }
 
