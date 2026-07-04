@@ -4,6 +4,9 @@
 // 并发内存池 - NUMA感知设计
 // 固定块模型（4KB），线程本地缓存，跨线程释放支持
 
+#include "definition.h"
+#include "SpinBackoff.h"
+
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -11,8 +14,6 @@
 #include <mutex>
 #include <thread>
 #include <vector>
-#include <stdexcept>
-#include <new>
 #include <algorithm>
 #include <cstdlib>
 #include <iostream>
@@ -50,6 +51,9 @@ constexpr size_t TLS_CAPACITY = 128;
 
 // 每个远程链表的最大长度
 constexpr size_t REMOTE_LIST_CAPACITY = 32;
+
+// 大页大小（2MB）
+constexpr size_t HUGE_PAGE_SIZE = 2ULL * 1024 * 1024;
 
 //==============================================================================
 // 辅助工具
@@ -113,13 +117,19 @@ struct alignas(CACHE_LINE_SIZE) Arena
 // RemoteListHead - 远程链表头
 //==============================================================================
 
-// 用于 ThreadLocalCache 中的远程链表
-struct RemoteListHead
+// 用于 ThreadLocalCache 中的远程链表。
+// 尾部填充至缓存行大小，避免相邻 arena 的 remote list 产生伪共享。
+struct alignas(CACHE_LINE_SIZE) RemoteListHead
 {
     FreeBlock* head;
     size_t count;
+    char padding[CACHE_LINE_SIZE - sizeof(FreeBlock*) - sizeof(size_t)];
 
-    RemoteListHead() : head(nullptr), count(0) {}
+    RemoteListHead() : head(nullptr), count(0)
+    {
+        static_assert(sizeof(RemoteListHead) == CACHE_LINE_SIZE,
+                      "RemoteListHead must occupy exactly one cache line");
+    }
 };
 
 //==============================================================================
@@ -169,10 +179,10 @@ public:
     // 析构函数，释放所有 mmap 内存
     ~ConcurrentMemoryPool();
 
-    // 分配一个 4KB 块，失败时抛出 std::bad_alloc
+    // 分配一个 4KB 块，失败时调用 std::exit(-1)
     void* allocate();
 
-    // 分配可变大小的块，失败时抛出 std::bad_alloc
+    // 分配可变大小的块，失败时调用 std::exit(-1)
     void* allocate_large(size_t bytes);
 
     // 释放一个之前分配的块
@@ -220,7 +230,10 @@ private:
     // 获取当前线程应该使用的 Arena 索引
     int get_thread_arena_index() const;
 
-    //--------------------------------------------------------------------------
+    // 构建按 NUMA 距离排序的候选 Arena 索引列表（用于本地 Arena 耗尽时窃取）
+    inline void build_numa_distance_order();
+
+    //----------------------------------------------------------------------
     // 成员变量
     //--------------------------------------------------------------------------
 
@@ -257,14 +270,17 @@ private:
     // 总可用 CPU 数
     int total_cpus_;
 
+    // 按 NUMA 距离排序的候选 Arena 索引，[local_index][0] 为本地，后续按距离递增
+    int numa_distance_order_[MAX_NUMA_NODES][MAX_NUMA_NODES];
+
     // init_arenas 前已分配的大块偏移
-    alignas(CACHE_LINE_SIZE) std::atomic<size_t> pre_arena_offset_{ 0 };
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> pre_arena_offset_{0};
 
     // 保护 pre_arena_offset_ 的互斥锁
     std::mutex pre_arena_mutex_;
 
     // Arena 是否已初始化
-    alignas(CACHE_LINE_SIZE) std::atomic<bool> arenas_initialized_{ false };
+    alignas(CACHE_LINE_SIZE) std::atomic<bool> arenas_initialized_{false};
 
     // 线程本地缓存
     static inline thread_local ThreadLocalCache tls_cache_;
@@ -323,6 +339,8 @@ inline ThreadLocalCache::~ThreadLocalCache()
             rl.count = 0;
         }
     }
+
+    pool = nullptr;
 }
 
 //==============================================================================
@@ -330,13 +348,18 @@ inline ThreadLocalCache::~ThreadLocalCache()
 //==============================================================================
 
 inline ConcurrentMemoryPool::ConcurrentMemoryPool(size_t total_bytes)
-    : num_arenas_(1), mmap_base_(nullptr), mmap_size_(0), memory_start_(nullptr), memory_size_(0), page_size_(4096), total_blocks_(0), numa_available_(false), total_cpus_(1)
+    : num_arenas_(1), mmap_base_(nullptr), mmap_size_(0), memory_start_(nullptr), memory_size_(0),
+      page_size_(4096), total_blocks_(0), numa_available_(false), total_cpus_(1)
 {
     // 初始化数组
     std::memset(cpus_per_node_, 0, sizeof(cpus_per_node_));
+    std::memset(numa_distance_order_, 0, sizeof(numa_distance_order_));
 
     // 初始化 NUMA 信息
     init_numa_info();
+
+    // 初始化距离顺序：默认本地优先，其余按索引
+    build_numa_distance_order();
 
     if (total_bytes == 0)
     {
@@ -442,14 +465,57 @@ inline void ConcurrentMemoryPool::init_numa_info()
 #endif
 }
 
+inline void ConcurrentMemoryPool::build_numa_distance_order()
+{
+    // 初始化：本地节点优先，其余按 NUMA 距离排序（若可用），否则按索引顺序。
+    for (int local = 0; local < MAX_NUMA_NODES; ++local)
+    {
+        // 默认顺序：本地优先，然后按索引
+        for (int j = 0; j < MAX_NUMA_NODES; ++j)
+        {
+            numa_distance_order_[local][j] = (local + j) % MAX_NUMA_NODES;
+        }
+
+        if (local >= num_arenas_)
+            continue;
+
+#if HAS_LIBNUMA
+        if (numa_available_)
+        {
+            // 计算 local 到所有其他节点的距离
+            struct DistIndex
+            {
+                int distance;
+                int index;
+            };
+            DistIndex dists[MAX_NUMA_NODES];
+            for (int node = 0; node < num_arenas_; ++node)
+            {
+                dists[node].distance = numa_distance(local, node);
+                dists[node].index = node;
+            }
+            // 按距离升序排序（距离相同则索引小的在前）
+            std::sort(dists, dists + num_arenas_,
+                      [](const DistIndex& a, const DistIndex& b) {
+                          if (a.distance != b.distance)
+                              return a.distance < b.distance;
+                          return a.index < b.index;
+                      });
+            for (int j = 0; j < num_arenas_; ++j)
+            {
+                numa_distance_order_[local][j] = dists[j].index;
+            }
+            // 剩余位置保持默认，不会被访问
+        }
+#endif
+    }
+}
+
 inline void ConcurrentMemoryPool::mmap_total_memory(size_t total_bytes)
 {
-    constexpr size_t huge_page_size = 2 * 1024 * 1024; // 2MB
-
     // 总大小向上对齐到 2MB，并多申请 2MB 用于地址对齐
-    size_t aligned_size = align_up(total_bytes, huge_page_size);
-    size_t request_size = aligned_size + huge_page_size;
-
+    size_t aligned_size = align_up(total_bytes, HUGE_PAGE_SIZE);
+    size_t request_size = aligned_size + HUGE_PAGE_SIZE;
 
     // 尝试使用大页
     void* addr = mmap(nullptr, request_size,
@@ -461,7 +527,7 @@ inline void ConcurrentMemoryPool::mmap_total_memory(size_t total_bytes)
     {
         mmap_base_ = addr;
         mmap_size_ = request_size;
-        page_size_ = huge_page_size;
+        page_size_ = HUGE_PAGE_SIZE;
     }
     else
     {
@@ -485,19 +551,14 @@ inline void ConcurrentMemoryPool::mmap_total_memory(size_t total_bytes)
         madvise(mmap_base_, mmap_size_, MADV_HUGEPAGE);
     }
 
-
-
-    // 尝试建议使用透明大页
-    madvise(mmap_base_, mmap_size_, MADV_HUGEPAGE);
-
     // 确保 memory_start_ 是 2MB 对齐的
     uintptr_t raw = reinterpret_cast<uintptr_t>(mmap_base_);
-    uintptr_t aligned = align_up(raw, huge_page_size);
+    uintptr_t aligned = align_up(raw, HUGE_PAGE_SIZE);
     memory_start_ = reinterpret_cast<void*>(aligned);
     memory_size_ = aligned_size;
 
     // 对齐检查
-    if (!is_aligned(reinterpret_cast<uintptr_t>(memory_start_), huge_page_size))
+    if (!is_aligned(reinterpret_cast<uintptr_t>(memory_start_), HUGE_PAGE_SIZE))
     {
         std::cerr << "mmap memory_start_ is not 2MB aligned" << std::endl;
         std::exit(-1);
@@ -511,8 +572,7 @@ inline void* ConcurrentMemoryPool::allocate_before_init_arenas(uint64_t bytes)
         return nullptr;
     }
 
-    constexpr size_t huge_page_size = 2 * 1024 * 1024;
-    size_t alloc_size = align_up(static_cast<size_t>(bytes), huge_page_size);
+    size_t alloc_size = align_up(static_cast<size_t>(bytes), HUGE_PAGE_SIZE);
 
     std::lock_guard<std::mutex> lock(pre_arena_mutex_);
 
@@ -533,7 +593,7 @@ inline void* ConcurrentMemoryPool::allocate_before_init_arenas(uint64_t bytes)
     pre_arena_offset_ += alloc_size;
 
     // 对齐断言：memory_start_ 是 2MB 对齐，current_offset 也是 2MB 对齐增长
-    if (!is_aligned(reinterpret_cast<uintptr_t>(ptr), huge_page_size))
+    if (!is_aligned(reinterpret_cast<uintptr_t>(ptr), HUGE_PAGE_SIZE))
     {
         std::cerr << "allocate_before_init_arenas alignment error" << std::endl;
         std::exit(-1);
@@ -551,8 +611,6 @@ inline void ConcurrentMemoryPool::init_arenas()
         std::cerr << "init_arenas already called" << std::endl;
         std::exit(-1);
     }
-
-    constexpr size_t huge_page_size = 2 * 1024 * 1024;
 
     size_t used = pre_arena_offset_;
     char* arena_start = static_cast<char*>(memory_start_) + used;
@@ -613,45 +671,50 @@ inline void ConcurrentMemoryPool::init_arenas()
     arenas_initialized_.store(true, std::memory_order_release);
 }
 
-// something wrong
-void ConcurrentMemoryPool::perform_first_touch(size_t num_threads)
+// NUMA-aware first-touch：将每个 Arena 的内存页按 NUMA 节点本地线程并行写入，
+// 触发页面实际分配在对应节点上。
+inline void ConcurrentMemoryPool::perform_first_touch(size_t num_threads)
 {
     if (!num_threads) {
-        num_threads = total_cpus_;  // 或 std::thread::hardware_concurrency()
+        num_threads = static_cast<size_t>(total_cpus_);
     }
-    // 限制不超过 total_cpus_，避免过多线程
-    num_threads = std::min<size_t>(num_threads, total_cpus_);
+    num_threads = std::max<size_t>(1, std::min<size_t>(num_threads, static_cast<size_t>(total_cpus_)));
 
-    // 如果 num_threads 为 0（比如 total_cpus_=0），则直接用单线程 touch 所有内存
-    if (num_threads == 0) num_threads = 1;
-
+    // 计算每个 Arena 应分配的线程数，按 CPU 比例分配
     std::vector<int> threads_per_arena(num_arenas_, 0);
     int remaining = static_cast<int>(num_threads);
     for (int i = 0; i < num_arenas_; ++i)
     {
+        if (cpus_per_node_[i] <= 0)
+        {
+            threads_per_arena[i] = 0;
+            continue;
+        }
         if (i == num_arenas_ - 1)
         {
             threads_per_arena[i] = remaining;
         }
         else
         {
-            threads_per_arena[i] = (num_threads * cpus_per_node_[i]) / total_cpus_;
-            // 若该节点无 CPU，则不分配线程（避免绑定失败）
-            if (cpus_per_node_[i] == 0)
-            {
-                threads_per_arena[i] = 0;
-            }
-            else if (threads_per_arena[i] < 1)
+            threads_per_arena[i] = static_cast<int>((num_threads * cpus_per_node_[i]) / total_cpus_);
+            if (threads_per_arena[i] < 1)
             {
                 threads_per_arena[i] = 1;
             }
             remaining -= threads_per_arena[i];
         }
     }
-    // 确保剩余线程分配到最后一个节点（即使它无 CPU）
+    // 如果还有剩余线程，分配给第一个有 CPU 的节点
     if (remaining > 0)
     {
-        threads_per_arena[num_arenas_ - 1] += remaining;
+        for (int i = 0; i < num_arenas_ && remaining > 0; ++i)
+        {
+            if (cpus_per_node_[i] > 0)
+            {
+                threads_per_arena[i] += remaining;
+                remaining = 0;
+            }
+        }
     }
 
     std::vector<std::thread> threads;
@@ -659,38 +722,35 @@ void ConcurrentMemoryPool::perform_first_touch(size_t num_threads)
     {
         if (threads_per_arena[arena_idx] == 0) continue;
         Arena& arena = arenas_[arena_idx];
-        size_t arena_bytes = static_cast<char*>(arena.end_addr) -
-            static_cast<char*>(arena.start_addr);
+        size_t arena_bytes = static_cast<size_t>(
+            static_cast<char*>(arena.end_addr) - static_cast<char*>(arena.start_addr));
         size_t pages = arena_bytes / page_size_;
         if (pages == 0) continue;
 
         size_t pages_per_thread = pages / threads_per_arena[arena_idx];
-        if (pages_per_thread == 0) pages_per_thread = 1; // 至少 touch 一页
+        if (pages_per_thread == 0) pages_per_thread = 1;
 
         for (int rank = 0; rank < threads_per_arena[arena_idx]; ++rank)
         {
-            threads.emplace_back([this, arena_idx, rank, pages, pages_per_thread, threads_per_arena]() {
+            size_t start_page = rank * pages_per_thread;
+            size_t end_page = (rank == threads_per_arena[arena_idx] - 1) ?
+                pages : (rank + 1) * pages_per_thread;
+            if (end_page > pages) end_page = pages;
+
+            threads.emplace_back([this, arena_idx, start_page, end_page]() {
 #if HAS_LIBNUMA
                 if (numa_available_ && cpus_per_node_[arena_idx] > 0)
                 {
-                    if (numa_run_on_node(arena_idx) != 0)
-                    {
-                        // 绑定失败，记录警告，但不影响 touch（可能分配在错误节点）
-                        // 可考虑使用 mbind 作为 fallback
-                    }
+                    // 绑定到目标节点，失败不影响 touch（可能分配在错误节点）
+                    numa_run_on_node(arena_idx);
                 }
 #endif
                 char* start = static_cast<char*>(arenas_[arena_idx].start_addr);
-                size_t start_page = rank * pages_per_thread;
-                size_t end_page = (rank == threads_per_arena[arena_idx] - 1) ?
-                    pages : (rank + 1) * pages_per_thread;
-                // 确保不超过 pages
-                if (end_page > pages) end_page = pages;
-
                 for (size_t p = start_page; p < end_page; ++p)
                 {
+                    // 只触摸每页的第一个字节，使用 volatile 防止 O3 优化掉
                     volatile char* vp = start + p * page_size_;
-                    *vp = 0;  // 强制写入，触发物理页分配
+                    *vp = 0;
                 }
                 });
         }
@@ -709,6 +769,7 @@ inline char* ConcurrentMemoryPool::bump_allocate_from_arena(Arena& arena, size_t
     size_t aligned_bytes = align_up(bytes, BLOCK_SIZE);
     char* arena_end = static_cast<char*>(arena.end_addr);
 
+    SpinBackoff backoff;
     for (;;)
     {
         char* cursor = arena.bump_cursor.load(std::memory_order_relaxed);
@@ -731,6 +792,7 @@ inline char* ConcurrentMemoryPool::bump_allocate_from_arena(Arena& arena, size_t
         {
             return cursor;
         }
+        backoff.backoff();
     }
 }
 
@@ -742,6 +804,7 @@ inline FreeBlock* ConcurrentMemoryPool::batch_allocate_from_bump(Arena& arena, s
     }
 
     char* arena_end = static_cast<char*>(arena.end_addr);
+    SpinBackoff backoff;
 
     for (;;)
     {
@@ -783,6 +846,7 @@ inline FreeBlock* ConcurrentMemoryPool::batch_allocate_from_bump(Arena& arena, s
             out_count = allocate_blocks;
             return head;
         }
+        backoff.backoff();
     }
 }
 
@@ -908,11 +972,11 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
         return ptr;
     }
 
-    int start_index = (tls.local_arena_index + 1) % num_arenas_;
+    // 按 NUMA 距离顺序尝试其他 Arena
     for (int i = 0; i < num_arenas_; ++i)
     {
-        int candidate = (start_index + i) % num_arenas_;
-        if (candidate == tls.local_arena_index)
+        int candidate = numa_distance_order_[tls.local_arena_index][i];
+        if (candidate < 0 || candidate >= num_arenas_ || candidate == tls.local_arena_index)
             continue;
 
         ptr = bump_allocate_from_arena(arenas_[candidate], bytes);
@@ -955,13 +1019,13 @@ inline void* ConcurrentMemoryPool::allocate()
             FreeBlock* block = tls.local_free_stack;
             tls.local_free_stack = block->next;
             tls.local_free_count--;
+
             return block;
         }
         fetched = batch_allocate_from_arena(*tls.local_arena, &head, &tail, BATCH_SIZE);
     }
 
     // 2. 本地栈为空，从本地 Arena 批量获取
-
     if (fetched > 0)
     {
         // 第一个块立即返回
@@ -971,15 +1035,15 @@ inline void* ConcurrentMemoryPool::allocate()
         tls.local_free_stack = head->next;
         result->next = nullptr;
         tls.local_free_count = fetched - 1;
+
         return result;
     }
 
-    // 3. 本地 Arena 为空，尝试跨 Arena 窃取
-    int start_index = (tls.local_arena_index + 1) % num_arenas_;
+    // 3. 本地 Arena 为空，尝试按 NUMA 距离顺序跨 Arena 窃取
     for (int i = 0; i < num_arenas_; ++i)
     {
-        int candidate = (start_index + i) % num_arenas_;
-        if (candidate == tls.local_arena_index)
+        int candidate = numa_distance_order_[tls.local_arena_index][i];
+        if (candidate < 0 || candidate >= num_arenas_ || candidate == tls.local_arena_index)
             continue;
 
         fetched = batch_allocate_from_arena(arenas_[candidate], &head, &tail, BATCH_SIZE);
@@ -991,6 +1055,7 @@ inline void* ConcurrentMemoryPool::allocate()
             tls.local_free_stack = head->next;
             result->next = nullptr;
             tls.local_free_count = fetched - 1;
+
             return result;
         }
     }
@@ -1097,4 +1162,4 @@ inline int ConcurrentMemoryPool::get_current_arena_index() const
     return get_thread_arena_index();
 }
 
-#endif // MEMORY_POOL_HPP
+#endif // CONCURRENT_MEMORY_POOL_HEADER
