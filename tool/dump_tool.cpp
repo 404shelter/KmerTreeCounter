@@ -792,5 +792,5 @@ static int approximate_dispatch(const Options& opts)
 int main(int argc, char* argv[])
 {
     Options opts = parse_options(argc, argv);
-    int x =  opts.is_precise ? precise_dispatch(opts) : approximate_dispatch(opts);;
+    return opts.is_precise ? precise_dispatch(opts) : approximate_dispatch(opts);;
 }
