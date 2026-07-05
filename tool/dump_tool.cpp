@@ -791,14 +791,6 @@ static int approximate_dispatch(const Options& opts)
 
 int main(int argc, char* argv[])
 {
-    auto start = std::chrono::high_resolution_clock::now(); 
-
-    
     Options opts = parse_options(argc, argv);
-    int x =  opts.is_precise ? precise_dispatch(opts) : approximate_dispatch(opts);
-
-    auto end = std::chrono::high_resolution_clock::now();
-    auto duration = duration_cast<std::chrono::microseconds>(end - start);
-
-    std::cout << "耗时: " << duration.count() << " 微秒" << std::endl;
+    int x =  opts.is_precise ? precise_dispatch(opts) : approximate_dispatch(opts);;
 }
