@@ -31,6 +31,7 @@ struct Options
 {
     std::string tmp_dir;
     bool        is_precise      = false;
+    bool        sort_output     = false;
     uint32_t    k_len           = 0;
     uint32_t    max_threads     = 0;
     uint64_t    max_memory_bytes = 0;
@@ -93,26 +94,6 @@ private:
     std::mutex              cout_mtx_;
 };
 
-// k-mer → string  (with correct canonical decode)
-static char complement_char(char c)
-{
-    switch (c) {
-    case 'A': return 'T';
-    case 'C': return 'G';
-    case 'G': return 'C';
-    case 'T': return 'A';
-    default:  return c;
-    }
-}
-
-static std::string reverse_complement(const std::string& s)
-{
-    std::string rc = s;
-    std::reverse(rc.begin(), rc.end());
-    for (char& ch : rc) ch = complement_char(ch);
-    return rc;
-}
-
 template <uint32_t N>
 static std::string kmer_to_string(const kmer<N>& key, uint32_t k_len)
 {
@@ -133,9 +114,34 @@ static std::string kmer_to_string(const kmer<N>& key, uint32_t k_len)
         uint8_t base = (key.data[word_idx] >> bit_shift) & 0x3ULL;
         result[i] = BASE_CHARS[base];
     }
+    return result;
+}
 
-    const std::string rc = reverse_complement(result);
-    return result < rc ? result : rc;
+// Write kmer bases directly into a char buffer, return end pointer.
+template <uint32_t N>
+static char* kmer_to_buf(const kmer<N>& key, uint32_t k_len, char* buf)
+{
+    const uint32_t fw = k_len / BASES_PER_U64T;
+    const uint32_t tb = k_len % BASES_PER_U64T;
+    for (uint32_t i = 0; i < k_len; ++i) {
+        uint32_t word_idx, bit_shift;
+        if (tb > 0 && i < tb) {
+            word_idx  = fw;
+            bit_shift = 64 - 2 * tb + 2 * i;
+        } else {
+            uint32_t off = i - (tb > 0 ? tb : 0);
+            word_idx  = fw - 1 - (off / BASES_PER_U64T);
+            bit_shift = 2 * (off % BASES_PER_U64T);
+        }
+        *buf++ = BASE_CHARS[(key.data[word_idx] >> bit_shift) & 0x3];
+    }
+    return buf;
+}
+
+// Fast uint32 → chars (writes right-to-left, returns start pointer).
+inline char* fmt_u32(uint32_t n, char* end) {
+    do { *--end = '0' + (n % 10); n /= 10; } while (n);
+    return end;
 }
 
 // Sort-key: canonical k-mer → integer with oldest base at MSB.
@@ -196,16 +202,16 @@ static KeyT make_sort_key(const kmer<N>& kmer, uint32_t k_len)
     return key;
 }
 
-// Convert sort key back to string (oldest base already at MSB of key).
+// Write sort-key bases (oldest at MSB) directly into buf, return end ptr.
 template <typename KeyT>
-static std::string key_to_string(KeyT key, uint32_t k_len)
+static char* kmer_to_buf_from_key(KeyT key, uint32_t k_len, char* buf)
 {
-    std::string result(k_len, 'A');
-    for (uint32_t i = k_len; i-- > 0; ) {
-        result[i] = BASE_CHARS[key & 0x3];
-        key >>= 2;
+    // Write from MSB to LSB: each base is 2 bits, oldest at top.
+    for (uint32_t i = 0; i < k_len; ++i) {
+        uint32_t shift = 2 * (k_len - 1 - i);
+        *buf++ = BASE_CHARS[static_cast<uint32_t>((key >> shift) & 0x3)];
     }
-    return result;
+    return buf;
 }
 
 // 11-bit radix = 2048 buckets
@@ -348,10 +354,10 @@ static void parallel_lsd_radix_sort(std::vector<SortEntry<KeyT>>& entries,
 
 [[nodiscard]] static Options parse_options(int argc, char* argv[])
 {
-    if (argc < 7 || argc > 9) {
+    if (argc < 7 || argc > 10) {
         std::cerr << "Usage: dump_tool <precise/approximate> <tmp_dir> <k_len>"
                   << " <max_threads> <max_memory_gb> <output_file>"
-                  << " [min_freq=1] [max_freq=max]\n";
+                  << " [min_freq=1] [max_freq=max] [--sort]\n";
         exit(-1);
     }
     Options o;
@@ -365,8 +371,13 @@ static void parallel_lsd_radix_sort(std::vector<SortEntry<KeyT>>& entries,
     else if (std::strcmp(argv[1], "approximate") == 0) o.is_precise = false;
     else { std::cerr << "mode must be 'precise' or 'approximate'\n"; exit(-1); }
 
-    if (argc >= 8) o.min_freq = parse_u32(argv[7], "min_freq");
-    if (argc >= 9) o.max_freq = parse_u32(argv[8], "max_freq");
+    // Optional positional args: [min_freq] [max_freq]
+    // These are plain numbers; --sort is a flag (starts with '-')
+    int next_arg = 7;
+    if (argc > next_arg && argv[next_arg][0] != '-') o.min_freq = parse_u32(argv[next_arg++], "min_freq");
+    if (argc > next_arg && argv[next_arg][0] != '-') o.max_freq = parse_u32(argv[next_arg++], "max_freq");
+    if (argc > next_arg && std::strcmp(argv[next_arg], "--sort") == 0) o.sort_output = true;
+
     if (o.k_len == 0 || o.k_len > MAX_K)   { std::cerr << "invalid k_len\n"; exit(-1); }
     if (o.max_threads == 0)                 { std::cerr << "invalid max_threads\n"; exit(-1); }
     if (o.max_freq < o.min_freq)            { std::cerr << "max_freq < min_freq\n"; exit(-1); }
@@ -600,7 +611,40 @@ static void collect_remaining(FlatConcurrentHashMap<N>&       map,
 }
 
 
-// Phase 4 — compute sort keys, LSD radix sort, write output
+// ── common buffered output: kmer→buf + tab + count + newline → file ──
+constexpr size_t OUTPUT_BUF_SIZE = 4ULL * 1024 * 1024;
+
+template <uint32_t N>
+static void write_output(const std::vector<ExportRecord<N>>& records,
+                         const std::string&                  output_file,
+                         uint32_t                            k_len)
+{
+    int fd = ::open(output_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { std::cerr << "failed to open: " << output_file << '\n'; exit(1); }
+
+    std::vector<char> buf(OUTPUT_BUF_SIZE);
+    char* p = buf.data();
+    char* const end = buf.data() + buf.size();
+    char count_buf[16];
+    char* const count_end = count_buf + 16;
+
+    for (const auto& rec : records) {
+        if (static_cast<size_t>(end - p) < static_cast<size_t>(k_len) + 22) {
+            ::write(fd, buf.data(), static_cast<size_t>(p - buf.data()));
+            p = buf.data();
+        }
+        p = kmer_to_buf<N>(rec.key, k_len, p);
+        *p++ = '\t';
+        char* cs = fmt_u32(rec.count, count_end);
+        size_t cl = static_cast<size_t>(count_end - cs);
+        std::memcpy(p, cs, cl); p += cl;
+        *p++ = '\n';
+    }
+    if (p > buf.data())
+        ::write(fd, buf.data(), static_cast<size_t>(p - buf.data()));
+    ::close(fd);
+}
+
 template <uint32_t N>
 static void sort_and_write(std::vector<ExportRecord<N>>& records,
                            const std::string&            output_file,
@@ -610,9 +654,9 @@ static void sort_and_write(std::vector<ExportRecord<N>>& records,
     using KeyT = typename SortKeyType<N>::type;
     constexpr uint32_t key_bits = SortKeyType<N>::bits;
     uint32_t sort_bits = std::min<uint32_t>(key_bits, k_len * 2);
+    uint64_t n = records.size();
 
     // ── Build SortEntry array (compute key once per entry) ──
-    uint64_t n = records.size();
     std::vector<SortEntry<KeyT>> entries(n);
     const uint32_t fw = k_len / BASES_PER_U64T;
     const uint32_t tb = k_len % BASES_PER_U64T;
@@ -624,16 +668,31 @@ static void sort_and_write(std::vector<ExportRecord<N>>& records,
     // ── Parallel LSD radix sort by key ──
     parallel_lsd_radix_sort<KeyT>(entries, sort_bits, worker_count);
 
-    // ── Write sorted output ──
-    std::ofstream out(output_file, std::ios::out | std::ios::trunc);
-    if (!out) { std::cerr << "failed to open output: " << output_file << '\n'; exit(1); }
+    // ── Write sorted output (buffered) ──
+    int fd = ::open(output_file.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) { std::cerr << "failed to open: " << output_file << '\n'; exit(1); }
 
-    std::string line;
-    line.reserve(static_cast<size_t>(k_len) + 32);
+    std::vector<char> buf(OUTPUT_BUF_SIZE);
+    char* p = buf.data();
+    char* const end = buf.data() + buf.size();
+    char count_buf[16];
+    char* const count_end = count_buf + 16;
+
     for (uint64_t i = 0; i < n; ++i) {
-        line = key_to_string<KeyT>(entries[i].key, k_len);
-        out << line << '\t' << entries[i].count << '\n';
+        if (static_cast<size_t>(end - p) < static_cast<size_t>(k_len) + 22) {
+            ::write(fd, buf.data(), static_cast<size_t>(p - buf.data()));
+            p = buf.data();
+        }
+        p = kmer_to_buf_from_key<KeyT>(entries[i].key, k_len, p);
+        *p++ = '\t';
+        char* cs = fmt_u32(entries[i].count, count_end);
+        size_t cl = static_cast<size_t>(count_end - cs);
+        std::memcpy(p, cs, cl); p += cl;
+        *p++ = '\n';
     }
+    if (p > buf.data())
+        ::write(fd, buf.data(), static_cast<size_t>(p - buf.data()));
+    ::close(fd);
 }
 
 // precise mode
@@ -686,9 +745,12 @@ static int run_precise(const Options& opts)
     // Phase 3: collect remaining hash entries
     collect_remaining<N>(hash_map, results, opts.min_freq, opts.max_freq);
 
-    // Phase 4: sort & write
-    sort_and_write<N>(results, opts.output_file, opts.k_len, worker_count);
+    // Phase 4: write (with optional sort)
     progress.finish();
+    if (opts.sort_output)
+        sort_and_write<N>(results, opts.output_file, opts.k_len, worker_count);
+    else
+        write_output<N>(results, opts.output_file, opts.k_len);
 
     return 0;
 }
@@ -763,8 +825,11 @@ static int run_approximate(const Options& opts)
         v.clear();
     }
 
-    sort_and_write<N>(results, opts.output_file, opts.k_len, worker_count);
     progress.finish();
+    if (opts.sort_output)
+        sort_and_write<N>(results, opts.output_file, opts.k_len, worker_count);
+    else
+        write_output<N>(results, opts.output_file, opts.k_len);
     return 0;
 }
 
@@ -791,6 +856,13 @@ static int approximate_dispatch(const Options& opts)
 
 int main(int argc, char* argv[])
 {
+    auto start = std::chrono::high_resolution_clock::now(); 
+
     Options opts = parse_options(argc, argv);
-    return opts.is_precise ? precise_dispatch(opts) : approximate_dispatch(opts);;
+    int x = opts.is_precise ? precise_dispatch(opts) : approximate_dispatch(opts);
+
+    auto end = std::chrono::high_resolution_clock::now(); // 结束时间点
+    auto duration = duration_cast<std::chrono::microseconds>(end - start);
+
+    std::cout << "耗时: " << duration.count() << " 微秒" << std::endl;
 }
