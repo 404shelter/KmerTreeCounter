@@ -40,12 +40,6 @@ class CountingHashMap
 public:
     using KeyType = kmer<N>;
 
-    typedef struct Entry
-    {
-        KeyType key;
-        ValueType value;
-    } Entry;
-
     CountingHashMap() = default;
 
     /**
@@ -87,13 +81,6 @@ public:
     [[nodiscard]] bool full() const { return size_ >= MAX_ENTRIES; }
 
 private:
-    // Compile-time constants
-    static constexpr size_t ENTRY_SIZE = sizeof(Entry) + sizeof(uint8_t); // Entry + control byte
-    static constexpr size_t RAW_CAPACITY = MaxBytes / ENTRY_SIZE;
-    static constexpr size_t CAPACITY =
-        RAW_CAPACITY > 0 ? (1ULL << (63 - __builtin_clzll(RAW_CAPACITY))) : 1;
-    static constexpr double MAX_LOAD_FACTOR = 0.875; // recommended load factor
-    static constexpr size_t MAX_ENTRIES = static_cast<size_t>(CAPACITY * MAX_LOAD_FACTOR);
 
     // SIMD group size
 #if defined(__AVX2__)
@@ -103,6 +90,17 @@ private:
 #else
     static constexpr size_t GROUP_SIZE = 8;
 #endif
+
+    // Compile-time constants
+    static constexpr size_t ENTRY_SIZE = sizeof(KeyType) + sizeof(ValueType) + sizeof(uint8_t); // Key + Value + control byte
+    static constexpr size_t RAW_CAPACITY = MaxBytes / ENTRY_SIZE;
+    static_assert(RAW_CAPACITY >= GROUP_SIZE, "MaxBytes too small for CountingHashMap");
+    static constexpr size_t CAPACITY =
+        RAW_CAPACITY > 0 ? (1ULL << (63 - __builtin_clzll(RAW_CAPACITY))) : GROUP_SIZE;
+    static constexpr double MAX_LOAD_FACTOR = 0.875; // recommended load factor
+    static constexpr size_t MAX_ENTRIES = static_cast<size_t>(CAPACITY * MAX_LOAD_FACTOR);
+
+
 
     // Hash function
     static uint64_t hash_key(const KeyType& key)
@@ -119,7 +117,7 @@ private:
 
     // SIMD match and empty detection
     // Safe: controls_ has extra GROUP_SIZE-1 bytes, so SIMD load never overflows
-    std::pair<uint32_t, uint32_t> match_and_empty(size_t base, uint8_t fp) const
+    std::pair<uint32_t, uint32_t> match_and_empty(size_t base, uint8_t fp) const noexcept
     {
 
 #if defined(__AVX2__)
@@ -149,16 +147,17 @@ private:
                 empty_mask |= (1u << i);
             else if (c == fp)
                 match_mask |= (1u << i);
-        }
+    }
         return { match_mask, empty_mask };
 #endif
-    }
+}
 
     // Data members
     // Extra GROUP_SIZE-1 bytes for safe SIMD load at boundary (no branch needed)
     alignas(32) uint8_t controls_[CAPACITY + GROUP_SIZE - 1] = {};
 
-    Entry entries_[CAPACITY];
+    KeyType keys_[CAPACITY];
+    ValueType counts_[CAPACITY] = {};
 
     size_t size_ = 0;
 };
@@ -167,15 +166,14 @@ private:
 template <uint32_t N, size_t MaxBytes, typename ValueType>
 bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
 {
+    constexpr uint64_t mod = CAPACITY - 1;
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
-    size_t idx = h & (CAPACITY - 1);
-
-    size_t first_empty = SIZE_MAX;
+    size_t idx = h & mod;
 
     for (size_t probe = 0; probe < CAPACITY; probe += GROUP_SIZE)
     {
-        size_t base = (idx + probe) & (CAPACITY - 1);
+        size_t base = (idx + probe) & mod;
 
         auto [match_mask, empty_mask] = match_and_empty(base, fp);
 
@@ -183,46 +181,34 @@ bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
         while (match_mask)
         {
             int bit = __builtin_ctz(match_mask);
-            size_t slot = (base + bit) & (CAPACITY - 1);
-            if (entries_[slot].key == key) [[likely]]
+            size_t slot = (base + bit) & mod;
+            if (keys_[slot] == key)
             {
-                ++entries_[slot].value;
+                counts_[slot]++;
                 return true;
             }
             match_mask &= (match_mask - 1);
         }
 
-        // Record first empty slot
-        if (first_empty == SIZE_MAX && empty_mask)
+        // 遇到空槽立即插入并返回
+        if (empty_mask) [[likely]]
         {
-            first_empty = (base + __builtin_ctz(empty_mask)) & (CAPACITY - 1);
+            // 正常负载下，绝大多数情况在这里返回
+            int bit = __builtin_ctz(empty_mask);
+            size_t slot = (base + bit) & mod;
+
+            controls_[slot] = fp;
+            if (slot < GROUP_SIZE - 1) {
+                controls_[CAPACITY + slot] = fp;
+            }
+            keys_[slot] = key;
+            counts_[slot] = 1;
+            ++size_;
+            return true;
         }
-
-        if (empty_mask)
-            break;
     }
 
-    // Table full check
-    if (MAX_ENTRIES <= size_) [[unlikely]]
-    {
-        return false;
-    }
-    if (first_empty == SIZE_MAX) [[unlikely]]
-    {
-        return false;
-    }
-
-    // Insert new entry
-    controls_[first_empty] = fp;
-    // Sync to tail mirror if in first GROUP_SIZE-1 slots
-    if (first_empty < GROUP_SIZE - 1)
-    {
-        controls_[CAPACITY + first_empty] = fp;
-    }
-    entries_[first_empty].key = key;
-    entries_[first_empty].value = 1;
-    ++size_;
-    return true;
+    return false;
 }
 
 template <uint32_t N, size_t MaxBytes, typename ValueType>
@@ -231,9 +217,9 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func)
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
-        if (controls_[i] != 0)
+        if (controls_[i] != 0) [[likely]]
         {
-            func(entries_[i].key, entries_[i].value);
+            func(keys_[i], counts_[i]);
         }
     }
 }
@@ -244,9 +230,9 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func) const
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
-        if (controls_[i] != 0)
+        if (controls_[i] != 0) [[likely]]
         {
-            func(entries_[i].key, entries_[i].value);
+            func(keys_[i], counts_[i]);
         }
     }
 }
