@@ -80,7 +80,9 @@ void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_
     while (!classifier_workloads.empty())
     {
         ClassifierWorkload work_load = classifier_workloads.top();
+#ifdef TEST_MODE
         std::cout << "Classifier " << work_load.classifier_index << " total prefix count: " << work_load.count << std::endl;
+#endif
         classifier_workloads.pop();
     }
 }
@@ -104,7 +106,9 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
         bloom_filter_capacity[i] = std::max(std::bit_ceil(estimated_capacity), standard_bloom_filter_capacity);
         max_bloom_filter_capacity = std::max(max_bloom_filter_capacity, bloom_filter_capacity[i]);
     }
+#ifdef TEST_MODE
     std::cout << "Max Bloom Filter capacity: " << max_bloom_filter_capacity << std::endl;
+#endif
 }
 
 
@@ -183,7 +187,9 @@ int process_main()
     }
 
     average_count /= prefix_counts.size();
+#ifdef TEST_MODE
     std::cout << "Average prefix count: " << average_count << std::endl;
+#endif
 
     lpt(prefix_counts, classifier_num);
     calculate_bloom_filter_capacity(prefix_counts, estimated_file_size);
@@ -277,6 +283,7 @@ int process_main()
     const auto parse_classifier_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - parser_end).count();
     const auto read_parse_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(parser_end - read_end).count();
 
+#ifdef TEST_MODE
     std::cout << "Init elapsed us: " << init_elapsed_us << std::endl;
     std::cout << "Read elapsed us: " << read_elapsed_us << std::endl;
     std::cout << "Mid elapsed us: " << mid_elapsed_us << std::endl;
@@ -287,7 +294,7 @@ int process_main()
     std::cout << "Final elapsed us: " << final_elapsed_us << std::endl;
     std::cout << "Total elapsed us: " << total_elapsed_us << std::endl;
 
-#ifdef TEST_MODE
+
     SpinLock::flush_spin_loops_for_current_thread();
     std::cout << "SpinLock spin_loops: " << SpinLock::spin_loops() << std::endl;
     std::cout << "Parser producer enqueue total spin time: " << parser_thread_pool->producer_enqueue_spin_time.load() << std::endl;
