@@ -100,7 +100,7 @@ public:
     {
         const uint64_t h1 = XXH3_64bits(&k_mer, sizeof(kmer<N>));
         const uint64_t h2 = rapidhash(&k_mer, sizeof(kmer<N>));
-        const res = mix_hash(h1, h2);
+        const uint64_t res = mix_hash(h1, h2);
         return res;
     }
 
