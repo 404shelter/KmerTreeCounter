@@ -166,6 +166,12 @@ private:
 template <uint32_t N, size_t MaxBytes, typename ValueType>
 bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
 {
+
+    if(size_ >= MAX_ENTRIES) [[unlikely]]
+    {
+        return false; // Table is full
+    }
+
     constexpr uint64_t mod = CAPACITY - 1;
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
