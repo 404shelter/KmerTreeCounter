@@ -141,6 +141,8 @@ public:
                 return;
             }
 
+            cpu_relax(); // 短暂暂停，避免过高的缓存行刷新
+
             for (concurrent_node<N>* cur_node = old_chain_first_node; cur_node != last_find_first_node; cur_node = cur_node->next)
             {
                 if (k_mer == cur_node->k_mer)
