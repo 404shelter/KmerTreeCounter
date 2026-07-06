@@ -2,6 +2,7 @@
 #define COUNTING_HASH_MAP_HEADER
 
 #include "kmer.h"
+#include "../include/rapidhash.h"
 
 #include <array>
 #include <cstddef>
@@ -52,7 +53,7 @@ public:
      * @param key The key to increment
      * @return true if successful, false if table is full
      */
-    bool increment(const KeyType &key);
+    bool increment(const KeyType& key);
 
     /**
      * @brief Iterate over all entries
@@ -60,7 +61,7 @@ public:
      * @param func Callback function for each entry
      */
     template <typename Func>
-    void for_each(Func &&func);
+    void for_each(Func&& func);
 
     /**
      * @brief Iterate over all entries (const version)
@@ -68,7 +69,7 @@ public:
      * @param func Callback function for each entry
      */
     template <typename Func>
-    void for_each(Func &&func) const;
+    void for_each(Func&& func) const;
 
     /**
      * @brief Clear all entries (fast: only clears control array)
@@ -94,7 +95,7 @@ private:
     static constexpr double MAX_LOAD_FACTOR = 0.875; // recommended load factor
     static constexpr size_t MAX_ENTRIES = static_cast<size_t>(CAPACITY * MAX_LOAD_FACTOR);
 
-// SIMD group size
+    // SIMD group size
 #if defined(__AVX2__)
     static constexpr size_t GROUP_SIZE = 32;
 #elif defined(__SSE4_2__)
@@ -104,14 +105,9 @@ private:
 #endif
 
     // Hash function
-    static uint64_t hash_key(const KeyType &key)
+    static uint64_t hash_key(const KeyType& key)
     {
-        uint64_t h = key.data[0];
-        for (uint32_t i = 1; i < N; ++i)
-        {
-            h ^= key.data[i];
-            h *= 0x9e3779b97f4a7c15ULL;
-        }
+        const uint64_t h = rapidhash(&key, sizeof(KeyType));
         return h;
     }
 
@@ -128,21 +124,21 @@ private:
 
 #if defined(__AVX2__)
         __m256i ctrl = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i *>(&controls_[base]));
+            reinterpret_cast<const __m256i*>(&controls_[base]));
         __m256i fp_vec = _mm256_set1_epi8(static_cast<char>(fp));
 
         uint32_t match_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, fp_vec));
         uint32_t empty_mask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(ctrl, _mm256_setzero_si256()));
-        return {match_mask, empty_mask};
+        return { match_mask, empty_mask };
 
 #elif defined(__SSE4_2__)
         __m128i ctrl = _mm_loadu_si128(
-            reinterpret_cast<const __m128i *>(&controls_[base]));
+            reinterpret_cast<const __m128i*>(&controls_[base]));
         __m128i fp_vec = _mm_set1_epi8(static_cast<char>(fp));
 
         uint32_t match_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl, fp_vec));
         uint32_t empty_mask = _mm_movemask_epi8(_mm_cmpeq_epi8(ctrl, _mm_setzero_si128()));
-        return {match_mask, empty_mask};
+        return { match_mask, empty_mask };
 
 #else
         uint32_t match_mask = 0, empty_mask = 0;
@@ -154,7 +150,7 @@ private:
             else if (c == fp)
                 match_mask |= (1u << i);
         }
-        return {match_mask, empty_mask};
+        return { match_mask, empty_mask };
 #endif
     }
 
@@ -169,7 +165,7 @@ private:
 
 // Implementation
 template <uint32_t N, size_t MaxBytes, typename ValueType>
-bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType &key)
+bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType& key)
 {
     uint64_t h = hash_key(key);
     uint8_t fp = fingerprint(h);
@@ -231,7 +227,7 @@ bool CountingHashMap<N, MaxBytes, ValueType>::increment(const KeyType &key)
 
 template <uint32_t N, size_t MaxBytes, typename ValueType>
 template <typename Func>
-void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func &&func)
+void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func)
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
@@ -244,7 +240,7 @@ void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func &&func)
 
 template <uint32_t N, size_t MaxBytes, typename ValueType>
 template <typename Func>
-void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func &&func) const
+void CountingHashMap<N, MaxBytes, ValueType>::for_each(Func&& func) const
 {
     for (size_t i = 0; i < CAPACITY; ++i)
     {
