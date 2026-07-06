@@ -486,23 +486,36 @@ private:
 
         uint64_t local_size_count = 0;
 
+        /*
         for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
         {
             kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
 
             for (uint64_t i = 0; i < input_kmer_block->count; ++i)
             {
-                // if (!thread_local_counting_has_map.increment(input_kmer_block->k_mers[i])) [[unlikely]]
-                // {
-                //     flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
-                //     thread_local_counting_has_map.increment(input_kmer_block->k_mers[i]);
-                // }
                 hash_map->increment(input_kmer_block->k_mers[i], local_size_count, 1);
             }
             memory_pool->deallocate(input_kmer_block);
         }
+        hash_map->add_size(local_size_count);
+        */
 
-        // flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+        for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
+        {
+            kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
+
+            for (uint64_t i = 0; i < input_kmer_block->count; ++i)
+            {
+                if (!thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i])) [[unlikely]]
+                {
+                    flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+                    thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i]);
+                }
+            }
+            memory_pool->deallocate(input_kmer_block);
+        }
+
+        flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
         hash_map->add_size(local_size_count);
     }
 
