@@ -103,10 +103,12 @@ public:
                 t->join();
             }
         }
-        for(uint32_t i = 0; i < classifier_count; i++)
+#ifdef TEST_MODE
+        for (uint32_t i = 0; i < classifier_count; i++)
         {
             std::cout << "Classifier " << i << " dealt k-mer count: " << deal_kmer_counts[i] << "\n";
         }
+#endif
     }
 };
 
