@@ -322,7 +322,7 @@ public:
         }
 
         if (quality_count_ > 0)
-            avgQuality = static_cast<int>(quality_sum_ / quality_count_);
+            avgQuality = static_cast<uint8_t>(quality_sum_ / quality_count_);
 
         ring_memory_pool_ptr_->producer_set_finished();
     }
