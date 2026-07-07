@@ -178,4 +178,6 @@ inline std::array<uint8_t, 1U << (2 * ROOT_BASES)> prefix_owners;
 
 inline std::array<void*, 1U << (2 * ROOT_BASES)> global_bloom_filter{};
 
+inline int avgQuality = 0; 
+
 #endif // TREE_DEFINITION_HEADER

@@ -50,6 +50,8 @@ class FastqPreReader
     size_t left_buffer_size_ = 0; // left_buffer_中有效碱基字节数
     bool is_gz_file = false; // 是否为 gzip 压缩文件
     gzFile gzfile_ = nullptr;
+    uint64_t quality_sum_   = 0;   
+    uint64_t quality_count_ = 0;   
 
 public:
     int k;
@@ -256,6 +258,15 @@ public:
                 }
 
                 const char* newline = static_cast<const char*>(newline_ptr);
+
+                // Accumulate quality scores
+                if (state_ == State::ReadQuality)
+                {
+                    for (const char* p = cur; p < newline; ++p)
+                        quality_sum_ += static_cast<uint64_t>(*p);
+                    quality_count_ += static_cast<uint64_t>(newline - cur);
+                }
+
                 input_pos = static_cast<uint64_t>(newline - input_begin) + 1;
                 state_ = advance_state_on_newline(state_);
                 continue;
@@ -309,6 +320,9 @@ public:
             ++input_pos;
             state_ = advance_state_on_newline(state_);
         }
+
+        if (quality_count_ > 0)
+            avgQuality = static_cast<int>(quality_sum_ / quality_count_);
 
         ring_memory_pool_ptr_->producer_set_finished();
     }
