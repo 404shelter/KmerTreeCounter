@@ -398,7 +398,7 @@ public:
 
         if (current_task.depth >= MAX_DEPTH - 1)
         {
-            insert_kmer_in_task_to_node_hash_map(current_task);
+            insert_kmer_in_task_to_node_hash_map_with_local_hash_map(current_task);
             return;
         }
 
@@ -479,7 +479,7 @@ public:
     }
 
 private:
-    void insert_kmer_in_task_to_node_hash_map(const Task<N>& current_task)
+    void insert_kmer_in_task_to_node_hash_map_with_local_hash_map(const Task<N>& current_task)
     {
         node<N>* parent = current_task.current_node;
         ConcurrentMap<N>* hash_map = ensure_hash_map(parent);
@@ -516,6 +516,26 @@ private:
         }
 
         flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+        hash_map->add_size(local_size_count);
+    }
+
+    void insert_kmer_in_task_to_node_hash_map_without_local_hash_map(const Task<N>& current_task)
+    {
+        node<N>* parent = current_task.current_node;
+        ConcurrentMap<N>* hash_map = ensure_hash_map(parent);
+
+        uint64_t local_size_count = 0;
+
+        for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
+        {
+            kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
+
+            for (uint64_t i = 0; i < input_kmer_block->count; ++i)
+            {
+                hash_map->increment(input_kmer_block->k_mers[i], local_size_count, 1);
+            }
+            memory_pool->deallocate(input_kmer_block);
+        }
         hash_map->add_size(local_size_count);
     }
 
@@ -594,7 +614,7 @@ private:
 
         if (t.depth >= MAX_DEPTH - 1) [[unlikely]]
         {
-            insert_kmer_in_task_to_node_hash_map(t);
+            insert_kmer_in_task_to_node_hash_map_without_local_hash_map(t);
             return;
         }
 
@@ -676,7 +696,7 @@ private:
                 if (t.depth >= MAX_DEPTH - 1)
                 {
                     // Can't create children at this depth
-                    insert_kmer_in_task_to_node_hash_map(t);
+                    insert_kmer_in_task_to_node_hash_map_without_local_hash_map(t);
                     return;
                 }
                 ensure_child_slab(current_node);
@@ -702,7 +722,7 @@ private:
         {
             std::cout << "Warning: Reached max depth but child slab already exists. Inserting into hash map." << std::endl;
             // Has existing child slab but can't descend at this depth
-            insert_kmer_in_task_to_node_hash_map(t);
+            insert_kmer_in_task_to_node_hash_map_without_local_hash_map(t);
             return;
         }
         for (uint64_t block_index = 0; block_index < t.count; ++block_index)
@@ -757,7 +777,7 @@ private:
                     task.depth = frame.depth;
                     task.count = current->count;
                     task.kmer_blocks = current->kmer_blocks;
-                    insert_kmer_in_task_to_hash_map(task);
+                    insert_kmer_in_task_to_node_hash_map_without_local_hash_map(task);
                     current->count = 0;
                     current->active_block = nullptr;
                 }
@@ -831,7 +851,7 @@ private:
                         task.depth = frame.depth;
                         task.count = current->count;
                         task.kmer_blocks = current->kmer_blocks;
-                        insert_kmer_in_task_to_node_hash_map(task);
+                        insert_kmer_in_task_to_node_hash_map_without_local_hash_map(task);
                         current->count = 0;
                         current->active_block = nullptr;
                         export_hash_map(writer, hash_map);
