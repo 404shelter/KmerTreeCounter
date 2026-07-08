@@ -38,8 +38,6 @@ class SchedulerThreadPool final
 
     struct WorkerInfo
     {
-        std::atomic<bool> alive{ false };
-        std::atomic<bool> working{ false };
         std::atomic<uint32_t> depth{ INVALID_DEPTH };
     };
 
@@ -81,7 +79,6 @@ public:
         {
             worker_init(i, cur_depth);
             worker_threads_ptr_.push_back(std::make_unique<std::thread>(&SchedulerThreadPool::worker_thread_loop, this, i));
-            worker_infos[i].alive.store(true, std::memory_order_release);
 
             depth_worker_count[cur_depth].fetch_add(1, std::memory_order_release);
 
@@ -179,7 +176,6 @@ private:
         uint32_t processed = 0;
         if (worker_queues_[worker_id].try_dequeue(new_depth))
         {
-            worker_infos[worker_id].working.store(true, std::memory_order_release);
             worker_infos[worker_id].depth.store(new_depth, std::memory_order_release);
             depth_worker_count[depth].fetch_sub(1, std::memory_order_release);
             depth_worker_count[new_depth].fetch_add(1, std::memory_order_release);
@@ -210,15 +206,11 @@ private:
         {
             backoff.backoff();
         }
-
-        worker_infos[worker_id].working.store(false, std::memory_order_release);
     }
 
     void try_work(const uint32_t worker_id, uint32_t& retry_time)
     {
-        Task<N> task;
         uint32_t work_depth = worker_infos[worker_id].depth.load(std::memory_order_acquire);
-        backoff.reset();
 
         work_at_depth(worker_id, work_depth);
 
@@ -239,7 +231,6 @@ private:
 
     void worker_init(const uint32_t worker_id, const uint32_t depth)
     {
-        worker_infos[worker_id].working.store(true, std::memory_order_release);
         worker_infos[worker_id].depth.store(depth, std::memory_order_release);
     }
 
@@ -259,15 +250,6 @@ private:
         for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth)
         {
             depth_worker_count_snapshot[depth] = depth_worker_count[depth].load(std::memory_order_acquire);
-        }
-    }
-
-    void get_depth_pressure(std::array<double, MAX_DEPTH>& depth_pressure, const std::array<uint32_t, MAX_DEPTH>& depth_worker_count_snapshot)
-    {
-        for (uint32_t depth = 0; depth < MAX_DEPTH; ++depth)
-        {
-            uint32_t depth_task_count = layer_queues_ptr_->get_queue(depth)->size();
-            depth_pressure[depth] = depth_task_count / (static_cast<double>(depth_worker_count_snapshot[depth]) + 1);
         }
     }
 
@@ -316,7 +298,7 @@ private:
                         for (uint32_t w = 0; w < total_workers; ++w)
                         {
                             uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
-                            if (wd == max_d && wd != INVALID_DEPTH)
+                            if (wd == max_d)
                             {
                                 if (worker_queues_[w].try_enqueue(d))
                                     break;
@@ -354,7 +336,7 @@ private:
                     for (uint32_t w = 0; w < total_workers; ++w)
                     {
                         uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
-                        if (wd == min_d && wd != INVALID_DEPTH)
+                        if (wd == min_d)
                         {
                             if (worker_queues_[w].try_enqueue(max_d))
                                 break;
@@ -364,34 +346,38 @@ private:
             }
 
             // Drain mode: aggressively move workers from empty depths to non-empty ones
-            if (is_drain)
+            if (is_drain) [[unlikely]]
             {
-                for (uint32_t d = 0; d < MAX_DEPTH; ++d)
-                {
-                    uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
-                    if (qsize == 0 && depth_worker_count_snapshot[d] > 0)
+                
+                auto move_one_empty_to_work = [&](){
+                    for (uint32_t d = 0; d < MAX_DEPTH; ++d)
                     {
-                        for (uint32_t td = 0; td < MAX_DEPTH; ++td)
+                        uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
+                        if (qsize == 0 && depth_worker_count_snapshot[d] > 0)
                         {
-                            if (td == d) continue;
-
-                            uint32_t tqsize = layer_queues_ptr_->get_queue(td)->size();
-                            if (tqsize > 0 && depth_worker_count_snapshot[td] < hard_worker_upper_bound)
+                            for (uint32_t td = 0; td < MAX_DEPTH; ++td)
                             {
-                                for (uint32_t w = 0; w < total_workers; ++w)
+                                if (td == d) continue;
+
+                                uint32_t tqsize = layer_queues_ptr_->get_queue(td)->size();
+                                if (tqsize > 0 && depth_worker_count_snapshot[td] < hard_worker_upper_bound)
                                 {
-                                    uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
-                                    if (wd == d)
+                                    for (uint32_t w = 0; w < total_workers; ++w)
                                     {
-                                        if (worker_queues_[w].try_enqueue(td))
-                                            goto drain_migrated;
+                                        uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
+                                        if (wd == d)
+                                        {
+                                            if (worker_queues_[w].try_enqueue(td))
+                                                return;
+                                        }
                                     }
                                 }
                             }
                         }
                     }
-                }
-            drain_migrated:;
+                };
+
+                move_one_empty_to_work();
             }
 
 
