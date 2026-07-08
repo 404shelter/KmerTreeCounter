@@ -121,7 +121,7 @@ public:
              posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM); // 随机访问提示
         }
 
-        need_read_ = std::min(file_size_, (ssize_t)256U * 1024 * 1024);
+        need_read_ = std::min((ssize_t)get_estimated_raw_fastq_file_size(), (ssize_t)256U * 1024 * 1024);
 
         file_buffer = new char[chunk_size_];
     }
