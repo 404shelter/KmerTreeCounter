@@ -25,16 +25,15 @@ class SchedulerThreadPool final
 {
     constexpr static uint32_t WORKER_QUEUE_CAPACITY = 4;
     constexpr static uint32_t INVALID_DEPTH = MAX_DEPTH;
-    constexpr static uint32_t MAX_TRY_TIME = 32;
     constexpr static uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
     constexpr static uint32_t MAX_PROCESS_TASKS = 128;
+    static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
 
     // Scheduler algorithm constants
     static constexpr uint32_t SCHEDULE_INTERVAL_US = 2;
     static constexpr double PRESSURE_EMA_ALPHA = 0.25;
     static constexpr double HYSTERESIS_RATIO = 1.5;
     static constexpr uint32_t DRAIN_INTERVAL_US = 1;
-    static constexpr uint32_t MIGRATION_PER_CYCLE_MAX = 1;
 
     struct WorkerInfo
     {
@@ -155,12 +154,12 @@ private:
         }
     }
 
-    uint32_t process_batch_at_depth(const uint32_t depth)
+    uint32_t process_batch_at_depth(const uint32_t depth, const uint32_t max_process_tasks = MAX_PROCESS_TASKS)
     {
         Task<N> task;
         auto queue = layer_queues_ptr_->get_queue(depth);
         uint32_t processed = 0;
-        while (processed < MAX_PROCESS_TASKS && queue->try_dequeue(task))
+        while (processed < max_process_tasks && queue->try_dequeue(task))
         {
             tree_ptr_->thread_add_kmer(task);
             layer_queues_ptr_->decrease_size();
@@ -184,7 +183,7 @@ private:
         }
         else
         {
-            processed = process_batch_at_depth(depth);
+            processed = process_batch_at_depth(depth, MAX_PROCESS_TASKS / 2);
 
             if (processed)
             {
@@ -202,31 +201,15 @@ private:
     void work_at_depth(const uint32_t worker_id, const uint32_t depth)
     {
         uint32_t processed = process_batch_at_depth(depth);
-        if (processed == 0) [[unlikely]]
-        {
-            backoff.backoff();
-        }
     }
 
-    void try_work(const uint32_t worker_id, uint32_t& retry_time)
+    void try_work(const uint32_t worker_id)
     {
         uint32_t work_depth = worker_infos[worker_id].depth.load(std::memory_order_acquire);
 
         work_at_depth(worker_id, work_depth);
 
-        if (try_switch_depth(worker_id, work_depth))
-        {
-            retry_time = 0;
-        }
-        else
-        {
-            retry_time++;
-            if (retry_time >= MAX_TRY_TIME)
-            {
-                tree_ptr_->check_and_deal_with_local_stack();
-                retry_time = 0;
-            }
-        }
+        try_switch_depth(worker_id, work_depth);
     }
 
     void worker_init(const uint32_t worker_id, const uint32_t depth)
@@ -236,11 +219,17 @@ private:
 
     void worker_thread_loop(const uint32_t worker_id)
     {
-        uint32_t retry_time = 0;
+        uint32_t loop_round = 0;
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
         {
-            try_work(worker_id, retry_time);
+            try_work(worker_id);
+            loop_round++;
+            if (loop_round >= FORCE_DEAL_WITH_LOCAL_STACK_ROUND)
+            {
+                tree_ptr_->check_and_deal_with_local_stack();
+                loop_round = 0;
+            }
         }
         drain_all(worker_id);
     }
