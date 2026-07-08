@@ -22,8 +22,6 @@
 #include <zlib.h>
 #include <thread>
 #include <atomic>
-#include <cerrno>
-#include <csignal>
 
 template <uint32_t N>
 class FastqPreReader
@@ -40,6 +38,7 @@ class FastqPreReader
     };
 
     static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
+    static constexpr uint64_t PIPELINE_QUEUE_CAPACITY = 16; // must be power of 2
 
     State state_ = State::ReadHeader;
     int fd_ = -1;
@@ -57,7 +56,9 @@ class FastqPreReader
     uint64_t quality_sum_   = 0;
     uint64_t quality_count_ = 0;
 
-    int pipe_write_fd_ = -1;    
+    std::vector<char*> pipeline_buffers_;
+    SPMCRingQueue<::content_type, PIPELINE_QUEUE_CAPACITY> pipeline_data_queue_;
+    MPSCRingQueue<char*, PIPELINE_QUEUE_CAPACITY> pipeline_free_queue_;
     std::thread io_thread_;
 
 public:
@@ -104,10 +105,22 @@ public:
                 std::cerr << "Failed to open gzip file: " << filename << std::endl;
                 std::exit(-1);
             }
-            // 重置 fd_ 位置到开头，供 I/O 线程从头读取压缩数据
             if (lseek(fd_, 0, SEEK_SET) == -1) {
                 std::cerr << "Failed to seek to beginning" << std::endl;
                 std::exit(-1);
+            }
+
+            // 分配pipeline buffers，预入队到free queue
+            pipeline_buffers_.resize(PIPELINE_QUEUE_CAPACITY);
+            for (uint64_t i = 0; i < PIPELINE_QUEUE_CAPACITY; ++i)
+            {
+                pipeline_buffers_[i] = static_cast<char*>(std::aligned_alloc(4096, chunk_size_));
+                if (!pipeline_buffers_[i])
+                {
+                    std::cerr << "Failed to allocate pipeline buffer" << std::endl;
+                    std::exit(-1);
+                }
+                pipeline_free_queue_.enqueue(pipeline_buffers_[i]);
             }
         }
 
@@ -140,36 +153,29 @@ public:
         {
             ::close(fd_);
         }
-        if (pipe_write_fd_ != -1)
-        {
-            ::close(pipe_write_fd_);
-        }
         delete[] file_buffer;
+        for (char* buf : pipeline_buffers_)
+        {
+            if (buf)
+            {
+                std::free(buf);
+            }
+        }
     }
 
     void pre_read()
     {
+        ::content_type current_input{nullptr, 0};
+        bool have_input = false;
+
         if (is_gz_file)
         {
-            gzclose(gzfile_);
-            int pipefd[2];
-            if (::pipe(pipefd) == -1)
+            if (file_buffer)
             {
-                std::cerr << "Failed to create pipe" << std::endl;
-                std::exit(-1);
+                delete[] file_buffer;
+                file_buffer = nullptr;
             }
-            gzfile_ = gzdopen(pipefd[0], "rb");
-            if (gzfile_ == nullptr)
-            {
-                std::cerr << "Failed to gzdopen pipe" << std::endl;
-                std::exit(-1);
-            }
-            pipe_write_fd_ = pipefd[1];
-
-            // 增加 pipe buffer 大小以提升流水线并行度
-            ::fcntl(pipe_write_fd_, F_SETPIPE_SZ, 1 << 20); // 1MB
-
-            // 启动 I/O 线程
+            // Start I/O thread
             io_thread_ = std::thread(&FastqPreReader::io_thread_func, this);
         }
         else
@@ -183,18 +189,18 @@ public:
             }
         }
 
-        read_impl();
+        parse_loop(current_input, have_input);
 
         if (is_gz_file)
         {
-            if (gzfile_ != nullptr)
-            {
-                gzclose(gzfile_);
-                gzfile_ = nullptr;
-            }
             io_thread_.join();
+            // Return remaining input buffer
+            if (have_input && current_input.data != nullptr)
+            {
+                pipeline_free_queue_.enqueue(current_input.data);
+            }
 
-            pipe_write_fd_ = -1;
+            file_buffer = nullptr;
         }
 
         if (quality_count_ > 0)
@@ -216,40 +222,42 @@ public:
     }
 
 private:
-    //I/O thread
+    // I/O thread
     void io_thread_func()
     {
-        ::signal(SIGPIPE, SIG_IGN);
-
-        std::vector<char> buf(chunk_size_);
         while (true)
         {
-            ssize_t n = ::read(fd_, buf.data(), chunk_size_);
-            if (n < 0) [[unlikely]]
+            char* buf = nullptr;
+            pipeline_free_queue_.dequeue(buf);
+
+            int bytes_read = gzread(gzfile_, buf, static_cast<unsigned int>(chunk_size_));
+
+            if (bytes_read < 0) [[unlikely]]
             {
-                std::cerr << "Failed to read compressed data in I/O thread" << std::endl;
+                std::cerr << "Failed to read fastq data in I/O thread" << std::endl;
                 std::exit(-1);
             }
-            if (n == 0)
+
+            if (bytes_read == 0)
             {
+                pipeline_free_queue_.enqueue(buf);
+                pipeline_data_queue_.enqueue({nullptr, 0});
                 break;
             }
 
-            ssize_t written = ::write(pipe_write_fd_, buf.data(), static_cast<size_t>(n));
-            if (written < 0) [[unlikely]]
+            have_read_.fetch_add(static_cast<ssize_t>(bytes_read), std::memory_order_relaxed);
+            pipeline_data_queue_.enqueue({buf, static_cast<uint64_t>(bytes_read)});
+
+            // 达到采样上限
+            if (have_read_.load(std::memory_order_relaxed) >= need_read_)
             {
-                if (errno == EPIPE)
-                {
-                    break;
-                }
-                std::cerr << "Failed to write to pipe in I/O thread" << std::endl;
-                std::exit(-1);
+                pipeline_data_queue_.enqueue({nullptr, 0});
+                break;
             }
         }
-        ::close(pipe_write_fd_);
     }
 
-    void read_impl()
+    void parse_loop(::content_type& current_input, bool& have_input)
     {
         assert(ring_memory_pool_ptr_ != nullptr && "RingMemoryPool pointer must not be null");
         char* block_ptr = nullptr;
@@ -268,7 +276,7 @@ private:
         bool eof = false;
         bool stop = false;
 
-        // 非gzip分段读取
+        // Non-gzip segment state
         ssize_t segment_need = need_read_ / 3;
         if (segment_need == 0) segment_need = 1;
         int current_segment = 0;
@@ -293,36 +301,38 @@ private:
 
             if (input_pos >= input_size && !eof)
             {
-                ssize_t bytes_read = 0;
-                if(is_gz_file){
-                    bytes_read = gzread(gzfile_, file_buffer, static_cast<unsigned int>(chunk_size_));
-                }else{
-                    bytes_read = ::read(fd_, file_buffer, chunk_size_);
-                }
-
-                if (bytes_read < 0) [[unlikely]]
-                {
-                    std::cerr << "Failed to read fastq data" << std::endl;
-                    std::exit(-1);
-                }
-
                 if (is_gz_file)
                 {
-                    // gz: 读到EOF或达到need_read_限制
-                    if (bytes_read == 0 || have_read_.load(std::memory_order_relaxed) >= need_read_) [[unlikely]]
+                    if (have_input && current_input.data != nullptr)
+                    {
+                        pipeline_free_queue_.enqueue(current_input.data);
+                        have_input = false;
+                    }
+                    pipeline_data_queue_.dequeue(current_input);
+
+                    if (current_input.data == nullptr)
                     {
                         eof = true;
                     }
                     else
                     {
+                        have_input = true;
+                        file_buffer = current_input.data;
                         input_pos = 0;
-                        input_size = static_cast<uint64_t>(bytes_read);
-                        have_read_.fetch_add(static_cast<ssize_t>(bytes_read), std::memory_order_relaxed);
+                        input_size = current_input.length;
                     }
                 }
                 else
                 {
-                    if (bytes_read == 0) [[unlikely]]
+                    ssize_t bytes_read = ::read(fd_, file_buffer, chunk_size_);
+
+                    if (bytes_read < 0) [[unlikely]]
+                    {
+                        std::cerr << "Failed to read fastq data" << std::endl;
+                        std::exit(-1);
+                    }
+
+                    if (bytes_read == 0)
                     {
                         eof = true;
                     }
