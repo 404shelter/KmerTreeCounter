@@ -38,7 +38,7 @@ class SchedulerThreadPool final
 
     struct WorkerInfo
     {
-        std::atomic<uint32_t> depth{ INVALID_DEPTH };
+        alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> depth{ INVALID_DEPTH };
     };
 
     const uint32_t thread_count_;
@@ -348,8 +348,8 @@ private:
             // Drain mode: aggressively move workers from empty depths to non-empty ones
             if (is_drain) [[unlikely]]
             {
-                
-                auto move_one_empty_to_work = [&](){
+
+                auto move_one_empty_to_work = [&]() {
                     for (uint32_t d = 0; d < MAX_DEPTH; ++d)
                     {
                         uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
@@ -375,7 +375,7 @@ private:
                             }
                         }
                     }
-                };
+                    };
 
                 move_one_empty_to_work();
             }
