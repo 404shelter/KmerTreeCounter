@@ -30,10 +30,10 @@ class SchedulerThreadPool final
     static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
 
     // Scheduler algorithm constants
-    static constexpr uint32_t SCHEDULE_INTERVAL_US = 2;
+    static constexpr uint32_t SCHEDULE_INTERVAL_NS = 1000;
     static constexpr double PRESSURE_EMA_ALPHA = 0.25;
     static constexpr double HYSTERESIS_RATIO = 1.5;
-    static constexpr uint32_t DRAIN_INTERVAL_US = 1;
+    static constexpr uint32_t DRAIN_INTERVAL_NS = 500;
 
     struct WorkerInfo
     {
@@ -370,8 +370,8 @@ private:
             }
 
 
-            uint32_t interval = is_drain ? DRAIN_INTERVAL_US : SCHEDULE_INTERVAL_US;
-            std::this_thread::sleep_for(std::chrono::microseconds(interval));
+            uint32_t interval = is_drain ? DRAIN_INTERVAL_NS : SCHEDULE_INTERVAL_NS;
+            std::this_thread::sleep_for(std::chrono::nanoseconds(interval));
         }
     }
 };
