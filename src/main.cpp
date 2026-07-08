@@ -104,7 +104,8 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
         double prefix_ratio = static_cast<double>(prefix_counts[i].load(std::memory_order_relaxed)) / total_prefix_count;
         const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 / 64);
         bloom_filter_capacity[i] = std::max(std::bit_ceil(estimated_capacity), MIN_BLOOM_FILTER_CAPACITY);
-        max_bloom_filter_capacity = std::min(max_bloom_filter_capacity, bloom_filter_capacity[i]);
+        bloom_filter_capacity[i] = std::min(bloom_filter_capacity[i], MAX_BLOOM_FILTER_CAPACITY);
+        max_bloom_filter_capacity = std::max(max_bloom_filter_capacity, bloom_filter_capacity[i]);
     }
 #ifdef TEST_MODE
     std::cout << "Max Bloom Filter capacity: " << max_bloom_filter_capacity << std::endl;
@@ -391,7 +392,7 @@ int main(int argc, char* argv[])
         return 1;
     }
 
-    max_bloom_filter_capacity = std::bit_ceil(std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, memory_limit * 1024ULL * 1024ULL * 1024ULL / (4 * 8) / (1ULL << (2 * ROOT_BASES))));
+    MAX_BLOOM_FILTER_CAPACITY = std::bit_ceil(std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, memory_limit * 1024ULL * 1024ULL * 1024ULL / (4 * 8) / (1ULL << (2 * ROOT_BASES))));
 
 
     if (k_len <= 32)

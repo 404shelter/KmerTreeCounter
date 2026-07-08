@@ -30,10 +30,10 @@ class SchedulerThreadPool final
     constexpr static uint32_t MAX_PROCESS_TASKS = 128;
 
     // Scheduler algorithm constants
-    static constexpr uint32_t SCHEDULE_INTERVAL_US = 200;
+    static constexpr uint32_t SCHEDULE_INTERVAL_US = 2;
     static constexpr double PRESSURE_EMA_ALPHA = 0.25;
     static constexpr double HYSTERESIS_RATIO = 1.5;
-    static constexpr uint32_t DRAIN_INTERVAL_US = 100;
+    static constexpr uint32_t DRAIN_INTERVAL_US = 1;
     static constexpr uint32_t MIGRATION_PER_CYCLE_MAX = 1;
 
     struct WorkerInfo
