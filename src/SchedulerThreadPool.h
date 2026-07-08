@@ -55,7 +55,7 @@ class SchedulerThreadPool final
     std::vector<WorkerInfo> worker_infos;
     std::array<double, MAX_DEPTH> depth_ema_pressure_{};
 
-    inline static thread_local SpinBackoff<> backoff;
+    inline static thread_local SpinBackoff<128, 128, 256> backoff;
 
 public:
     explicit SchedulerThreadPool(uint32_t thread_count, uint32_t producer_count, KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
