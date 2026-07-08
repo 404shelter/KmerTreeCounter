@@ -19,6 +19,8 @@
 #include <iostream>
 #include <cstdlib>
 #include <zlib.h>
+#include <thread>
+#include <atomic>
 
 template <uint32_t N>
 class FastqReader
@@ -41,7 +43,7 @@ class FastqReader
     State state_ = State::ReadHeader;
     int fd_ = -1;
     off_t file_size_ = 0;
-    off_t have_read_ = 0;
+    std::atomic<off_t> have_read_{0};
     uint64_t chunk_size_;
     std::string filename_;
     SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
@@ -50,6 +52,10 @@ class FastqReader
     size_t left_buffer_size_ = 0; // left_buffer_中有效碱基字节数
     bool is_gz_file = false; // 是否为 gzip 压缩文件
     gzFile gzfile_ = nullptr;
+
+    // ===== gzip pipe pipeline members 
+    int pipe_write_fd_ = -1;      // I/O线程向pipe写压缩数据
+    std::thread io_thread_;
 
 public:
 #ifdef TEST_MODE
@@ -94,6 +100,11 @@ public:
         ssize_t n = ::read(fd_, buf, 2);
         is_gz_file = (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B);
 
+        if (lseek(fd_, 0, SEEK_SET) == -1) {
+                std::cerr << "Failed to seek to beginning" << std::endl;
+                std::exit(-1);
+            }
+
         if(is_gz_file)
         {
             gzfile_ = gzopen(filename.c_str(), "rb");
@@ -101,15 +112,11 @@ public:
                 std::cerr << "Failed to open gzip file: " << filename << std::endl;
                 std::exit(-1);
             }
+            
         }
 
         else
         {
-            if (lseek(fd_, 0, SEEK_SET) == -1) {
-                std::cerr << "Failed to seek to beginning" << std::endl;
-                std::exit(-1);
-            }
-
             posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL); // 顺序访问提示
         }
 
@@ -123,13 +130,21 @@ public:
 
     ~FastqReader()
     {
-        if (gzfile_ != nullptr) 
+        if (io_thread_.joinable())
+        {
+            io_thread_.join();
+        }
+        if (gzfile_ != nullptr)
         {
             gzclose(gzfile_);
         }
             if (fd_ != -1)
         {
             ::close(fd_);
+        }
+        if (pipe_write_fd_ != -1)
+        {
+            ::close(pipe_write_fd_);
         }
         if (file_buffer)
         {
@@ -138,6 +153,74 @@ public:
     }
 
     void read()
+    {
+        if (is_gz_file)
+        {
+            gzclose(gzfile_);
+            int pipefd[2];
+            if (::pipe(pipefd) == -1)
+            {
+                std::cerr << "Failed to create pipe" << std::endl;
+                std::exit(-1);
+            }
+            gzfile_ = gzdopen(pipefd[0], "rb");
+            if (gzfile_ == nullptr)
+            {
+                std::cerr << "Failed to gzdopen pipe" << std::endl;
+                std::exit(-1);
+            }
+            pipe_write_fd_ = pipefd[1];
+
+            // 增加 pipe buffer 大小以提升流水线并行度
+            ::fcntl(pipe_write_fd_, F_SETPIPE_SZ, 1 << 20); // 1MB
+
+            // 启动 I/O 线程
+            io_thread_ = std::thread(&FastqReader::io_thread_func, this);
+        }
+
+        read_impl();
+
+        if (is_gz_file)
+        {
+            io_thread_.join();
+            pipe_write_fd_ = -1;
+        }
+
+        ring_memory_pool_ptr_->producer_set_finished();
+    }
+
+private:
+    // I/O thread
+    void io_thread_func()
+    {
+        std::vector<char> buf(chunk_size_);
+        while (true)
+        {
+            ssize_t n = ::read(fd_, buf.data(), chunk_size_);
+            if (n < 0) [[unlikely]]
+            {
+                std::cerr << "Failed to read compressed data in I/O thread" << std::endl;
+                std::exit(-1);
+            }
+            if (n == 0)
+            {
+                break;
+            }
+
+            ssize_t written = ::write(pipe_write_fd_, buf.data(), static_cast<size_t>(n));
+            if (written < 0) [[unlikely]]
+            {
+                std::cerr << "Failed to write to pipe in I/O thread" << std::endl;
+                std::exit(-1);
+            }
+
+            have_read_.fetch_add(static_cast<off_t>(written), std::memory_order_relaxed);
+        }
+        // 关闭写端, 通知解析线程 EOF
+        ::close(pipe_write_fd_);
+    }
+
+    void read_impl()
     {
         assert(ring_memory_pool_ptr_ != nullptr && "RingMemoryPool pointer must not be null");
         char* block_ptr = nullptr;
@@ -171,11 +254,11 @@ public:
             {
                 ssize_t bytes_read = 0;
                 if(is_gz_file){
-                    bytes_read = gzread(gzfile_, file_buffer, chunk_size_);
+                    bytes_read = gzread(gzfile_, file_buffer, static_cast<unsigned int>(chunk_size_));
                 }else{
                     bytes_read = ::read(fd_, file_buffer, chunk_size_);
                 }
-                
+
                 if (bytes_read < 0) [[unlikely]]
                 {
                     std::cerr << "Failed to read fastq data" << std::endl;
@@ -190,11 +273,15 @@ public:
                 {
                     input_pos = 0;
                     input_size = static_cast<uint64_t>(bytes_read);
-                    have_read_ += bytes_read;
-               
+
+                    if (!is_gz_file)
+                    {
+                        have_read_.fetch_add(static_cast<off_t>(bytes_read), std::memory_order_relaxed);
+                    }
+
                     // 进度更新频率为每增加1%，或达到100%时更新一次
-                    double current_read = is_gz_file ? static_cast<double>(gzoffset(gzfile_)) : static_cast<double>(have_read_);
-                    cur_percent = current_read / static_cast<double>(file_size_);
+                    off_t current_read = have_read_.load(std::memory_order_relaxed);
+                    cur_percent = static_cast<double>(current_read) / static_cast<double>(file_size_);
                     int cur_percent_int = static_cast<int>(cur_percent * 100);
                     if (cur_percent_int - last_reported_percent >= 1 || cur_percent_int == 100)
                     {
@@ -285,11 +372,8 @@ public:
             ++input_pos;
             state_ = advance_state_on_newline(state_);
         }
-
-        ring_memory_pool_ptr_->producer_set_finished();
     }
 
-private:
     State advance_state_on_newline(const State current) const
     {
         switch (current)
