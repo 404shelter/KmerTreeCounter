@@ -274,17 +274,18 @@ int process_main()
 
     const auto final_end = std::chrono::steady_clock::now();
 
+    const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - init_start).count();
+
+#ifdef TEST_MODE
     const auto init_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(init_end - init_start).count();
     const auto read_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start).count();
     const auto mid_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(mid_end - mid_start).count();
     const auto export_join_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(export_join_end - export_join_start).count();
     const auto final_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - final_start).count();
-    const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - init_start).count();
     const auto classifier_task_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(task_end - classifier_end).count();
     const auto parse_classifier_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - parser_end).count();
     const auto read_parse_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(parser_end - read_end).count();
 
-#ifdef TEST_MODE
     std::cout << "Init elapsed us: " << init_elapsed_us << std::endl;
     std::cout << "Read elapsed us: " << read_elapsed_us << std::endl;
     std::cout << "Mid elapsed us: " << mid_elapsed_us << std::endl;
@@ -293,9 +294,11 @@ int process_main()
     std::cout << "Between Classifier and Task elapsed us: " << classifier_task_elapsed_us << std::endl;
     std::cout << "Export join elapsed us: " << export_join_elapsed_us << std::endl;
     std::cout << "Final elapsed us: " << final_elapsed_us << std::endl;
+#endif
+
     std::cout << "Total elapsed us: " << total_elapsed_us << std::endl;
 
-
+#ifdef TEST_MODE
     SpinLock::flush_spin_loops_for_current_thread();
     std::cout << "SpinLock spin_loops: " << SpinLock::spin_loops() << std::endl;
     std::cout << "Parser producer enqueue total spin time: " << parser_thread_pool->producer_enqueue_spin_time.load() << std::endl;

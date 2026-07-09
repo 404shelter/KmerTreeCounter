@@ -1271,7 +1271,7 @@ private:
             }
 
             const kmer<N>& current_key = cursors[min_pos].block->k_mers[cursors[min_pos].index];
-            if (!has_prev)
+            if (!has_prev) [[unlikely]]
             {
                 prev_key = current_key;
                 prev_count = 1;
@@ -1296,7 +1296,7 @@ private:
             }
         }
 
-        if (has_prev)
+        if (has_prev) [[likely]]
         {
             append_export_record(writer, prev_key, prev_count);
         }
@@ -1319,6 +1319,10 @@ private:
             auto node_ptr = hash_map->bucket_head(i).load(std::memory_order_relaxed);
             while (node_ptr != nullptr)
             {
+                if (node_ptr->next != nullptr)
+                {
+                    __builtin_prefetch(node_ptr->next, 0, 0);
+                }
                 record.key = node_ptr->k_mer;
                 record.count = node_ptr->count.load(std::memory_order_relaxed);
                 append_export_record(writer, record.key, record.count);

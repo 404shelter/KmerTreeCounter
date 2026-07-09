@@ -23,11 +23,13 @@
 template <uint32_t N>
 class SchedulerThreadPool final
 {
-    constexpr static uint32_t WORKER_QUEUE_CAPACITY = 4;
-    constexpr static uint32_t INVALID_DEPTH = MAX_DEPTH;
-    constexpr static uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
-    constexpr static uint32_t MAX_PROCESS_TASKS = 128;
+    // Worker thread constants
+    static constexpr uint32_t WORKER_QUEUE_CAPACITY = 4;
+    static constexpr uint32_t INVALID_DEPTH = MAX_DEPTH;
+    static constexpr uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
+    static constexpr uint32_t MAX_PROCESS_TASKS = 128;
     static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
+    static constexpr uint32_t BEFORE_DRAIN_ROUND = 4;
 
     // Scheduler algorithm constants
     static constexpr uint32_t SCHEDULE_INTERVAL_NS = 1000;
@@ -186,6 +188,10 @@ private:
             processed = process_batch_at_depth(depth, MAX_PROCESS_TASKS / 2);
 
             if (processed)
+            {
+                backoff.decay();
+            }
+            else if (tree_ptr_->check_and_deal_with_local_stack())
             {
                 backoff.decay();
             }
