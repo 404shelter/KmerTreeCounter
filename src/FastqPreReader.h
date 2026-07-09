@@ -3,6 +3,7 @@
 
 #include "definition.h"
 #include "RingMemoryPool.h"
+#include "SPSCRingQueue.h"
 
 #include <string>
 #include <cassert>
@@ -57,8 +58,8 @@ class FastqPreReader
     uint64_t quality_count_ = 0;
 
     std::vector<char*> pipeline_buffers_;
-    SPMCRingQueue<::content_type, PIPELINE_QUEUE_CAPACITY> pipeline_data_queue_;
-    MPSCRingQueue<char*, PIPELINE_QUEUE_CAPACITY> pipeline_free_queue_;
+    SPSCRingQueue<::content_type, PIPELINE_QUEUE_CAPACITY> pipeline_data_queue_;
+    SPSCRingQueue<char*, PIPELINE_QUEUE_CAPACITY> pipeline_free_queue_;
     std::thread io_thread_;
 
 public:
