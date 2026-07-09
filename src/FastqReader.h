@@ -3,6 +3,7 @@
 
 #include "definition.h"
 #include "RingMemoryPool.h"
+#include "SPSCRingQueue.h"
 
 #include <cassert>
 #include <cstdio>
@@ -19,6 +20,8 @@
 #include <iostream>
 #include <cstdlib>
 #include <zlib.h>
+#include <thread>
+#include <atomic>
 
 template <uint32_t N>
 class FastqReader
@@ -35,13 +38,14 @@ class FastqReader
     };
 
     static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
+    static constexpr uint64_t PIPELINE_QUEUE_CAPACITY = 16; // must be power of 2
 
     int acbs_index = 0;
 
     State state_ = State::ReadHeader;
     int fd_ = -1;
     off_t file_size_ = 0;
-    off_t have_read_ = 0;
+    std::atomic<off_t> have_read_{0};
     uint64_t chunk_size_;
     std::string filename_;
     SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
@@ -50,6 +54,11 @@ class FastqReader
     size_t left_buffer_size_ = 0; // left_buffer_中有效碱基字节数
     bool is_gz_file = false; // 是否为 gzip 压缩文件
     gzFile gzfile_ = nullptr;
+
+    std::vector<char*> pipeline_buffers_;
+    SPSCRingQueue<::content_type, PIPELINE_QUEUE_CAPACITY> pipeline_data_queue_;
+    SPSCRingQueue<char*, PIPELINE_QUEUE_CAPACITY> pipeline_free_queue_;
+    std::thread io_thread_;
 
 public:
 #ifdef TEST_MODE
@@ -94,6 +103,11 @@ public:
         ssize_t n = ::read(fd_, buf, 2);
         is_gz_file = (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B);
 
+        if (lseek(fd_, 0, SEEK_SET) == -1) {
+            std::cerr << "Failed to seek to beginning" << std::endl;
+            std::exit(-1);
+        }
+
         if(is_gz_file)
         {
             gzfile_ = gzopen(filename.c_str(), "rb");
@@ -101,15 +115,23 @@ public:
                 std::cerr << "Failed to open gzip file: " << filename << std::endl;
                 std::exit(-1);
             }
+
+            // 分配pipeline buffers，预入队到free queue
+            pipeline_buffers_.resize(PIPELINE_QUEUE_CAPACITY);
+            for (uint64_t i = 0; i < PIPELINE_QUEUE_CAPACITY; ++i)
+            {
+                pipeline_buffers_[i] = static_cast<char*>(std::aligned_alloc(4096, chunk_size_));
+                if (!pipeline_buffers_[i])
+                {
+                    std::cerr << "Failed to allocate pipeline buffer" << std::endl;
+                    std::exit(-1);
+                }
+                pipeline_free_queue_.enqueue(pipeline_buffers_[i]);
+            }
         }
 
         else
         {
-            if (lseek(fd_, 0, SEEK_SET) == -1) {
-                std::cerr << "Failed to seek to beginning" << std::endl;
-                std::exit(-1);
-            }
-
             posix_fadvise(fd_, 0, 0, POSIX_FADV_SEQUENTIAL); // 顺序访问提示
         }
 
@@ -123,7 +145,11 @@ public:
 
     ~FastqReader()
     {
-        if (gzfile_ != nullptr) 
+        if (io_thread_.joinable())
+        {
+            io_thread_.join();
+        }
+        if (gzfile_ != nullptr)
         {
             gzclose(gzfile_);
         }
@@ -135,9 +161,81 @@ public:
         {
             std::free(file_buffer);
         }
+        for (char* buf : pipeline_buffers_)
+        {
+            if (buf)
+            {
+                std::free(buf);
+            }
+        }
     }
 
     void read()
+    {
+        // Pipeline state (only used when is_gz_file)
+        ::content_type current_input{nullptr, 0};
+        bool have_input = false;
+
+        if (is_gz_file)
+        {
+            // Free constructor-allocated file_buffer (not used in pipeline mode)
+            if (file_buffer)
+            {
+                std::free(file_buffer);
+                file_buffer = nullptr;
+            }
+            // Start I/O thread: decompresses gzip data into pipeline buffers
+            io_thread_ = std::thread(&FastqReader::io_thread_func, this);
+        }
+
+        parse_loop(current_input, have_input);
+
+        if (is_gz_file)
+        {
+            io_thread_.join();
+            // Return remaining input buffer
+            if (have_input && current_input.data != nullptr)
+            {
+                pipeline_free_queue_.enqueue(current_input.data);
+            }
+            
+            file_buffer = nullptr;
+        }
+
+        ring_memory_pool_ptr_->producer_set_finished();
+    }
+
+private:
+    // I/O thread
+    void io_thread_func()
+    {
+        while (true)
+        {
+            char* buf = nullptr;
+            pipeline_free_queue_.dequeue(buf);
+
+            int bytes_read = gzread(gzfile_, buf, static_cast<unsigned int>(chunk_size_));
+
+            if (bytes_read < 0) [[unlikely]]
+            {
+                std::cerr << "Failed to read fastq data in I/O thread" << std::endl;
+                std::exit(-1);
+            }
+
+            if (bytes_read == 0)
+            {
+                // EOF: return buffer and signal end with nullptr
+                pipeline_free_queue_.enqueue(buf);
+                pipeline_data_queue_.enqueue({nullptr, 0});
+                break;
+            }
+
+            have_read_.store(gzoffset(gzfile_), std::memory_order_relaxed);
+            pipeline_data_queue_.enqueue({buf, static_cast<uint64_t>(bytes_read)});
+        }
+    }
+
+    void parse_loop(::content_type& current_input, bool& have_input)
     {
         assert(ring_memory_pool_ptr_ != nullptr && "RingMemoryPool pointer must not be null");
         char* block_ptr = nullptr;
@@ -159,7 +257,6 @@ public:
         double cur_percent = 0.0;
         int last_reported_percent = 0;
 
-
         while (!stop)
         {
             if (!has_block)
@@ -169,32 +266,57 @@ public:
 
             if (input_pos >= input_size && !eof)
             {
-                ssize_t bytes_read = 0;
-                if(is_gz_file){
-                    bytes_read = gzread(gzfile_, file_buffer, chunk_size_);
-                }else{
-                    bytes_read = ::read(fd_, file_buffer, chunk_size_);
-                }
-                
-                if (bytes_read < 0) [[unlikely]]
+                if (is_gz_file)
                 {
-                    std::cerr << "Failed to read fastq data" << std::endl;
-                    std::exit(-1);
-                }
+                    if (have_input && current_input.data != nullptr)
+                    {
+                        pipeline_free_queue_.enqueue(current_input.data);
+                        have_input = false;
+                    }
+                    pipeline_data_queue_.dequeue(current_input);
 
-                if (bytes_read == 0) [[unlikely]]
-                {
-                    eof = true;
+                    if (current_input.data == nullptr)
+                    {
+                        eof = true;
+                    }
+                    else
+                    {
+                        have_input = true;
+                        file_buffer = current_input.data;
+                        input_pos = 0;
+                        input_size = current_input.length;
+
+                        off_t current_offset = have_read_.load(std::memory_order_relaxed);
+                        cur_percent = static_cast<double>(current_offset) / static_cast<double>(file_size_);
+                    }
                 }
                 else
                 {
-                    input_pos = 0;
-                    input_size = static_cast<uint64_t>(bytes_read);
-                    have_read_ += bytes_read;
-               
-                    // 进度更新频率为每增加1%，或达到100%时更新一次
-                    double current_read = is_gz_file ? static_cast<double>(gzoffset(gzfile_)) : static_cast<double>(have_read_);
-                    cur_percent = current_read / static_cast<double>(file_size_);
+                    ssize_t bytes_read = ::read(fd_, file_buffer, chunk_size_);
+
+                    if (bytes_read < 0) [[unlikely]]
+                    {
+                        std::cerr << "Failed to read fastq data" << std::endl;
+                        std::exit(-1);
+                    }
+
+                    if (bytes_read == 0)
+                    {
+                        eof = true;
+                    }
+                    else
+                    {
+                        input_pos = 0;
+                        input_size = static_cast<uint64_t>(bytes_read);
+                        have_read_.fetch_add(static_cast<off_t>(bytes_read), std::memory_order_relaxed);
+
+                        off_t current_read = have_read_.load(std::memory_order_relaxed);
+                        cur_percent = static_cast<double>(current_read) / static_cast<double>(file_size_);
+                    }
+                }
+                
+                if (!eof)
+                {
                     int cur_percent_int = static_cast<int>(cur_percent * 100);
                     if (cur_percent_int - last_reported_percent >= 1 || cur_percent_int == 100)
                     {
@@ -285,11 +407,8 @@ public:
             ++input_pos;
             state_ = advance_state_on_newline(state_);
         }
-
-        ring_memory_pool_ptr_->producer_set_finished();
     }
 
-private:
     State advance_state_on_newline(const State current) const
     {
         switch (current)
