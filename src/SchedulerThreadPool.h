@@ -16,7 +16,6 @@
 #include <utility>
 #include <barrier>
 #include <limits>
-#include <chrono>
 #include <mutex>
 #include <cmath>
 
@@ -30,15 +29,11 @@ class SchedulerThreadPool final
     static constexpr uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
     static constexpr uint32_t MAX_PROCESS_TASKS = 128;
     static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
-    static constexpr uint32_t BEFORE_DRAIN_ROUND = 4;
-
     // Scheduler algorithm constants
     static constexpr uint32_t SCHEDULE_INTERVAL_NS = 1000;
     static constexpr double PRESSURE_EMA_ALPHA = 0.25;
-    static constexpr double HYSTERESIS_RATIO = 1.5;
     static constexpr double HYSTERESIS_LOG_DELTA = 0.585;          // log2(1.5)
     static constexpr uint32_t DRAIN_INTERVAL_NS = 500;
-    static constexpr double STICKY_EMA_THRESHOLD = 1.5;
 
     struct WorkerInfo
     {
@@ -330,24 +325,7 @@ private:
 
             if (min_d != INVALID_DEPTH && (max_ema - min_ema) > HYSTERESIS_LOG_DELTA)
             {
-                bool migrate = true;
-
-                if (depth_ema_pressure_[min_d] >= STICKY_EMA_THRESHOLD)
-                {
-                    bool has_low_pressure = false;
-                    for (uint32_t d = 0; d < MAX_DEPTH; ++d)
-                    {
-                        if (depth_worker_count_snapshot[d] > 0
-                            && depth_ema_pressure_[d] < STICKY_EMA_THRESHOLD)
-                        {
-                            has_low_pressure = true;
-                            break;
-                        }
-                    }
-                    migrate = !has_low_pressure;
-                }
-
-                if (migrate && depth_worker_count_snapshot[max_d] < hard_worker_upper_bound)
+                if (depth_worker_count_snapshot[max_d] < hard_worker_upper_bound)
                 {
                     for (uint32_t w = 0; w < total_workers; ++w)
                     {
