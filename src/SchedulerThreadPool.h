@@ -3,7 +3,7 @@
 
 #include "definition.h"
 #include "LayerQueues.h"
-#include "MPMCRingQueue.h"
+#include "SPSCRingQueue.h"
 #include "NewKmerTree.h"
 #include "../src/SpinBackoff.h"
 
@@ -38,6 +38,7 @@ class SchedulerThreadPool final
     static constexpr double HYSTERESIS_RATIO = 1.5;
     static constexpr double HYSTERESIS_LOG_DELTA = 0.585;          // log2(1.5)
     static constexpr uint32_t DRAIN_INTERVAL_NS = 500;
+    static constexpr double STICKY_EMA_THRESHOLD = 1.5;
 
     struct WorkerInfo
     {
@@ -53,7 +54,7 @@ class SchedulerThreadPool final
     LayerQueues<N>* layer_queues_ptr_ = nullptr;
     std::thread scheduler_thread_;
     std::vector<std::unique_ptr<std::thread>> worker_threads_ptr_;
-    std::vector<MPMCRingQueue<uint32_t, WORKER_QUEUE_CAPACITY>> worker_queues_;
+    std::vector<SPSCRingQueue<uint32_t, WORKER_QUEUE_CAPACITY>> worker_queues_;
 
     std::array<std::atomic<int>, MAX_DEPTH> depth_worker_count{};
     std::vector<WorkerInfo> worker_infos;
@@ -329,7 +330,24 @@ private:
 
             if (min_d != INVALID_DEPTH && (max_ema - min_ema) > HYSTERESIS_LOG_DELTA)
             {
-                if (depth_worker_count_snapshot[max_d] < hard_worker_upper_bound)
+                bool migrate = true;
+
+                if (depth_ema_pressure_[min_d] >= STICKY_EMA_THRESHOLD)
+                {
+                    bool has_low_pressure = false;
+                    for (uint32_t d = 0; d < MAX_DEPTH; ++d)
+                    {
+                        if (depth_worker_count_snapshot[d] > 0
+                            && depth_ema_pressure_[d] < STICKY_EMA_THRESHOLD)
+                        {
+                            has_low_pressure = true;
+                            break;
+                        }
+                    }
+                    migrate = !has_low_pressure;
+                }
+
+                if (migrate && depth_worker_count_snapshot[max_d] < hard_worker_upper_bound)
                 {
                     for (uint32_t w = 0; w < total_workers; ++w)
                     {
