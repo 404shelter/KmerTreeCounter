@@ -107,7 +107,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     const double error_rate = std::pow(10.0, -(avgQuality - 33) * 0.1);
     const uint64_t quarter_memory_average_capacity = memory_limit * 1024ULL * 1024ULL * 1024ULL / 4 / sizeof(uint64_t) / (1ULL << (2 * ROOT_BASES));
     const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_len);
-    const double error_factor = 0.5 + singleton_rate_cause_by_error;
+    const double capacity_error_factor = std::min(0.5 + singleton_rate_cause_by_error, 1.0);
 
     const uint64_t estimated_total_kmers = estimated_file_size / 3;
     uint64_t total_prefix_count = 0;
@@ -126,7 +126,7 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     for (uint64_t i = 0; i < bloom_filter_capacity.size(); i++)
     {
         double prefix_ratio = static_cast<double>(prefix_counts[i].load(std::memory_order_relaxed)) / total_prefix_count;
-        const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 * error_factor / 64);
+        const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 * capacity_error_factor / 64);
         bloom_filter_capacity[i] = std::max(std::bit_ceil(estimated_capacity), MIN_BLOOM_FILTER_CAPACITY);
         bloom_filter_capacity[i] = std::min(bloom_filter_capacity[i], MAX_BLOOM_FILTER_CAPACITY);
         max_bloom_filter_capacity = std::max(max_bloom_filter_capacity, bloom_filter_capacity[i]);
