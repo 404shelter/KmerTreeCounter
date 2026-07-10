@@ -18,6 +18,7 @@
 #include <limits>
 #include <chrono>
 #include <mutex>
+#include <cmath>
 
 
 template <uint32_t N>
@@ -35,6 +36,7 @@ class SchedulerThreadPool final
     static constexpr uint32_t SCHEDULE_INTERVAL_NS = 1000;
     static constexpr double PRESSURE_EMA_ALPHA = 0.25;
     static constexpr double HYSTERESIS_RATIO = 1.5;
+    static constexpr double HYSTERESIS_LOG_DELTA = 0.585;          // log2(1.5)
     static constexpr uint32_t DRAIN_INTERVAL_NS = 500;
 
     struct WorkerInfo
@@ -253,8 +255,9 @@ private:
         for (uint32_t d = 0; d < MAX_DEPTH; ++d)
         {
             uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
-            double raw = static_cast<double>(qsize) / (worker_snapshot[d] + 1);
-            depth_ema_pressure_[d] = PRESSURE_EMA_ALPHA * raw + (1.0 - PRESSURE_EMA_ALPHA) * depth_ema_pressure_[d];
+            double raw = static_cast<double>(qsize) / (worker_snapshot[d] + 1.0);
+            double log_raw = std::log2(raw + 1.0);
+            depth_ema_pressure_[d] = PRESSURE_EMA_ALPHA * log_raw + (1.0 - PRESSURE_EMA_ALPHA) * depth_ema_pressure_[d];
         }
     }
 
@@ -324,7 +327,7 @@ private:
                 }
             }
 
-            if (min_d != INVALID_DEPTH && max_ema > min_ema * HYSTERESIS_RATIO)
+            if (min_d != INVALID_DEPTH && (max_ema - min_ema) > HYSTERESIS_LOG_DELTA)
             {
                 if (depth_worker_count_snapshot[max_d] < hard_worker_upper_bound)
                 {
