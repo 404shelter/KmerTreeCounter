@@ -3,7 +3,7 @@
 
 #include "definition.h"
 #include "LayerQueues.h"
-#include "MPMCRingQueue.h"
+#include "SPSCRingQueue.h"
 #include "NewKmerTree.h"
 #include "../src/SpinBackoff.h"
 
@@ -16,24 +16,24 @@
 #include <utility>
 #include <barrier>
 #include <limits>
-#include <chrono>
 #include <mutex>
+#include <cmath>
 
 
 template <uint32_t N>
 class SchedulerThreadPool final
 {
-    constexpr static uint32_t WORKER_QUEUE_CAPACITY = 4;
-    constexpr static uint32_t INVALID_DEPTH = MAX_DEPTH;
-    constexpr static uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
-    constexpr static uint32_t MAX_PROCESS_TASKS = 128;
+    // Worker thread constants
+    static constexpr uint32_t WORKER_QUEUE_CAPACITY = 4;
+    static constexpr uint32_t INVALID_DEPTH = MAX_DEPTH;
+    static constexpr uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
+    static constexpr uint32_t MAX_PROCESS_TASKS = 128;
     static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
-
     // Scheduler algorithm constants
-    static constexpr uint32_t SCHEDULE_INTERVAL_US = 2;
+    static constexpr uint32_t SCHEDULE_INTERVAL_NS = 1000;
     static constexpr double PRESSURE_EMA_ALPHA = 0.25;
-    static constexpr double HYSTERESIS_RATIO = 1.5;
-    static constexpr uint32_t DRAIN_INTERVAL_US = 1;
+    static constexpr double HYSTERESIS_LOG_DELTA = 0.585;          // log2(1.5)
+    static constexpr uint32_t DRAIN_INTERVAL_NS = 500;
 
     struct WorkerInfo
     {
@@ -49,13 +49,13 @@ class SchedulerThreadPool final
     LayerQueues<N>* layer_queues_ptr_ = nullptr;
     std::thread scheduler_thread_;
     std::vector<std::unique_ptr<std::thread>> worker_threads_ptr_;
-    std::vector<MPMCRingQueue<uint32_t, WORKER_QUEUE_CAPACITY>> worker_queues_;
+    std::vector<SPSCRingQueue<uint32_t, WORKER_QUEUE_CAPACITY>> worker_queues_;
 
     std::array<std::atomic<int>, MAX_DEPTH> depth_worker_count{};
     std::vector<WorkerInfo> worker_infos;
     std::array<double, MAX_DEPTH> depth_ema_pressure_{};
 
-    inline static thread_local SpinBackoff<> backoff;
+    inline static thread_local SpinBackoff<128, 128, 256> backoff;
 
 public:
     explicit SchedulerThreadPool(uint32_t thread_count, uint32_t producer_count, KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
@@ -168,11 +168,12 @@ private:
         return processed;
     }
 
-    // 所有 depth 切换全部由 try_swithch_depth 完成
+    // 所有 depth 切换全部由 try_switch_depth 完成
     bool try_switch_depth(const uint32_t worker_id, const uint32_t depth)
     {
+        uint32_t processed = process_batch_at_depth(depth);
+
         uint32_t new_depth = INVALID_DEPTH;
-        uint32_t processed = 0;
         if (worker_queues_[worker_id].try_dequeue(new_depth))
         {
             worker_infos[worker_id].depth.store(new_depth, std::memory_order_release);
@@ -183,32 +184,31 @@ private:
         }
         else
         {
-            processed = process_batch_at_depth(depth, MAX_PROCESS_TASKS / 2);
-
-            if (processed)
+            if (processed ==  MAX_PROCESS_TASKS)
+            {
+                backoff.double_decay();
+            }
+            else if (processed)
             {
                 backoff.decay();
             }
-            else
+            else if (tree_ptr_->get_local_stack_size() > 0)
             {
-                backoff.backoff();
+                tree_ptr_->deal_with_local_stack();
+                backoff.decay();
             }
+            else if(depth_worker_count[depth].load(std::memory_order_relaxed) > 1)
+            {
+                backoff.decay();
+            }
+            
             return false;
         }
-
-    }
-
-    void work_at_depth(const uint32_t worker_id, const uint32_t depth)
-    {
-        uint32_t processed = process_batch_at_depth(depth);
     }
 
     void try_work(const uint32_t worker_id)
     {
         uint32_t work_depth = worker_infos[worker_id].depth.load(std::memory_order_acquire);
-
-        work_at_depth(worker_id, work_depth);
-
         try_switch_depth(worker_id, work_depth);
     }
 
@@ -247,8 +247,9 @@ private:
         for (uint32_t d = 0; d < MAX_DEPTH; ++d)
         {
             uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
-            double raw = static_cast<double>(qsize) / (worker_snapshot[d] + 1);
-            depth_ema_pressure_[d] = PRESSURE_EMA_ALPHA * raw + (1.0 - PRESSURE_EMA_ALPHA) * depth_ema_pressure_[d];
+            double raw = static_cast<double>(qsize) / (worker_snapshot[d] + 1.0);
+            double log_raw = std::log2(raw + 1.0);
+            depth_ema_pressure_[d] = PRESSURE_EMA_ALPHA * log_raw + (1.0 - PRESSURE_EMA_ALPHA) * depth_ema_pressure_[d];
         }
     }
 
@@ -318,7 +319,7 @@ private:
                 }
             }
 
-            if (min_d != INVALID_DEPTH && max_ema > min_ema * HYSTERESIS_RATIO)
+            if (min_d != INVALID_DEPTH && (max_ema - min_ema) > HYSTERESIS_LOG_DELTA)
             {
                 if (depth_worker_count_snapshot[max_d] < hard_worker_upper_bound)
                 {
@@ -370,8 +371,8 @@ private:
             }
 
 
-            uint32_t interval = is_drain ? DRAIN_INTERVAL_US : SCHEDULE_INTERVAL_US;
-            std::this_thread::sleep_for(std::chrono::microseconds(interval));
+            uint32_t interval = is_drain ? DRAIN_INTERVAL_NS : SCHEDULE_INTERVAL_NS;
+            std::this_thread::sleep_for(std::chrono::nanoseconds(interval));
         }
     }
 };

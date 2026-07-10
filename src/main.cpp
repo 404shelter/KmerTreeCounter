@@ -28,12 +28,26 @@
 #include <bitset>
 #include <atomic>
 #include <algorithm>
+#include <cmath>
 
 uint32_t k_len;        // k-mer 的长度 (例如: 31, 41)
 uint32_t n_thread;     // 允许使用的总线程数
 uint64_t memory_limit; // 全局最大内存限制，单位为 GB
 uint64_t estimated_file_size;    // 输入 FASTQ 文件的估计大小，单位为字节
 std::string filename;
+
+void get_MAX_BLOOM_FILTER_CAPACITY()
+{
+#ifdef TEST_MODE
+    std::cout << "Average quality score: " << avgQuality << std::endl;
+#endif
+    const double error_rate = std::pow(10.0, -(avgQuality - 33) * 0.1);
+    const uint64_t quarter_memory_average_capacity = memory_limit * 1024ULL * 1024ULL * 1024ULL / 4 / sizeof(uint64_t) / (1ULL << (2 * ROOT_BASES));
+    const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_len);
+    const double error_factor = 0.5 + singleton_rate_cause_by_error;
+    const auto corrected_memory_average_capacity = std::bit_ceil(static_cast<uint64_t>(static_cast<double>(quarter_memory_average_capacity) * error_factor));
+    MAX_BLOOM_FILTER_CAPACITY = std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, corrected_memory_average_capacity);
+}
 
 void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_num)
 {
@@ -89,10 +103,20 @@ void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_
 
 void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_counts, uint64_t estimated_file_size)
 {
+
+    const double error_rate = std::pow(10.0, -(avgQuality - 33) * 0.1);
+    const uint64_t quarter_memory_average_capacity = memory_limit * 1024ULL * 1024ULL * 1024ULL / 4 / sizeof(uint64_t) / (1ULL << (2 * ROOT_BASES));
+    const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_len);
+    const double capacity_error_factor = std::min(0.5 + singleton_rate_cause_by_error, 1.0);
+
     const uint64_t estimated_total_kmers = estimated_file_size / 3;
     uint64_t total_prefix_count = 0;
 
     uint64_t max_bloom_filter_capacity = 0;
+
+#ifdef TEST_MODE
+    uint64_t total_bloom_filter_size = 0;
+#endif
 
     for (uint64_t i = 0; i < prefix_counts.size(); i++)
     {
@@ -102,13 +126,17 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     for (uint64_t i = 0; i < bloom_filter_capacity.size(); i++)
     {
         double prefix_ratio = static_cast<double>(prefix_counts[i].load(std::memory_order_relaxed)) / total_prefix_count;
-        const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 / 64);
+        const uint64_t estimated_capacity = static_cast<uint64_t>(estimated_total_kmers * prefix_ratio * 4.81 * capacity_error_factor / 64);
         bloom_filter_capacity[i] = std::max(std::bit_ceil(estimated_capacity), MIN_BLOOM_FILTER_CAPACITY);
         bloom_filter_capacity[i] = std::min(bloom_filter_capacity[i], MAX_BLOOM_FILTER_CAPACITY);
         max_bloom_filter_capacity = std::max(max_bloom_filter_capacity, bloom_filter_capacity[i]);
+#ifdef TEST_MODE
+        total_bloom_filter_size += bloom_filter_capacity[i];
+#endif
     }
 #ifdef TEST_MODE
     std::cout << "Max Bloom Filter capacity: " << max_bloom_filter_capacity << std::endl;
+    std::cout << "Total Bloom Filter size: " << total_bloom_filter_size * sizeof(uint64_t) / (1024 * 1024) << " MB" << std::endl;
 #endif
 }
 
@@ -192,6 +220,7 @@ int process_main()
     std::cout << "Average prefix count: " << average_count << std::endl;
 #endif
 
+    get_MAX_BLOOM_FILTER_CAPACITY();
     lpt(prefix_counts, classifier_num);
     calculate_bloom_filter_capacity(prefix_counts, estimated_file_size);
 
@@ -274,17 +303,18 @@ int process_main()
 
     const auto final_end = std::chrono::steady_clock::now();
 
+    const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - init_start).count();
+
+#ifdef TEST_MODE
     const auto init_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(init_end - init_start).count();
     const auto read_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(read_end - read_start).count();
     const auto mid_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(mid_end - mid_start).count();
     const auto export_join_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(export_join_end - export_join_start).count();
     const auto final_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - final_start).count();
-    const auto total_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(final_end - init_start).count();
     const auto classifier_task_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(task_end - classifier_end).count();
     const auto parse_classifier_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(classifier_end - parser_end).count();
     const auto read_parse_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(parser_end - read_end).count();
 
-#ifdef TEST_MODE
     std::cout << "Init elapsed us: " << init_elapsed_us << std::endl;
     std::cout << "Read elapsed us: " << read_elapsed_us << std::endl;
     std::cout << "Mid elapsed us: " << mid_elapsed_us << std::endl;
@@ -293,9 +323,11 @@ int process_main()
     std::cout << "Between Classifier and Task elapsed us: " << classifier_task_elapsed_us << std::endl;
     std::cout << "Export join elapsed us: " << export_join_elapsed_us << std::endl;
     std::cout << "Final elapsed us: " << final_elapsed_us << std::endl;
+#endif
+
     std::cout << "Total elapsed us: " << total_elapsed_us << std::endl;
 
-
+#ifdef TEST_MODE
     SpinLock::flush_spin_loops_for_current_thread();
     std::cout << "SpinLock spin_loops: " << SpinLock::spin_loops() << std::endl;
     std::cout << "Parser producer enqueue total spin time: " << parser_thread_pool->producer_enqueue_spin_time.load() << std::endl;
@@ -352,7 +384,7 @@ int main(int argc, char* argv[])
 
         if (argc >= 6)
         {
-            kmer_concurrent_hash_map_capacity = std::stoul(argv[5]);
+            kmer_concurrent_hash_map_capacity = std::max<uint32_t>(KMER_BATCH_SIZE / sizeof(std::atomic<void*>), std::bit_ceil(std::stoul(argv[5])));
         }
         if (argc >= 7)
         {
