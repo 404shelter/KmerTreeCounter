@@ -415,9 +415,19 @@ public:
         }
     }
 
-    size_t get_local_task_stack_size() const
+    size_t get_local_stack_size() const
     {
         return thread_local_task_stack.size();
+    }
+
+    void deal_with_local_stack()
+    {
+        while (!thread_local_task_stack.empty())
+        {
+            Task<N> task = thread_local_task_stack.back();
+            thread_local_task_stack.pop_back();
+            thread_add_kmer(task);
+        }
     }
 
     bool check_and_deal_with_local_stack()

@@ -168,11 +168,12 @@ private:
         return processed;
     }
 
-    // 所有 depth 切换全部由 try_swithch_depth 完成
+    // 所有 depth 切换全部由 try_switch_depth 完成
     bool try_switch_depth(const uint32_t worker_id, const uint32_t depth)
     {
+        uint32_t processed = process_batch_at_depth(depth);
+
         uint32_t new_depth = INVALID_DEPTH;
-        uint32_t processed = 0;
         if (worker_queues_[worker_id].try_dequeue(new_depth))
         {
             worker_infos[worker_id].depth.store(new_depth, std::memory_order_release);
@@ -183,14 +184,13 @@ private:
         }
         else
         {
-            processed = process_batch_at_depth(depth, MAX_PROCESS_TASKS / 2);
-
             if (processed)
             {
                 backoff.decay();
             }
-            else if (tree_ptr_->check_and_deal_with_local_stack())
+            else if (tree_ptr_->get_local_stack_size() > 0)
             {
+                tree_ptr_->deal_with_local_stack();
                 backoff.decay();
             }
             else
@@ -199,20 +199,11 @@ private:
             }
             return false;
         }
-
-    }
-
-    void work_at_depth(const uint32_t worker_id, const uint32_t depth)
-    {
-        uint32_t processed = process_batch_at_depth(depth);
     }
 
     void try_work(const uint32_t worker_id)
     {
         uint32_t work_depth = worker_infos[worker_id].depth.load(std::memory_order_acquire);
-
-        work_at_depth(worker_id, work_depth);
-
         try_switch_depth(worker_id, work_depth);
     }
 
