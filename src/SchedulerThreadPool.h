@@ -23,9 +23,6 @@
 template <uint32_t N>
 class SchedulerThreadPool final
 {
-
-    static constexpr uint32_t START_SLEEP_MS = 500;
-
     // Worker thread constants
     static constexpr uint32_t WORKER_QUEUE_CAPACITY = 4;
     static constexpr uint32_t INVALID_DEPTH = MAX_DEPTH;
@@ -222,8 +219,6 @@ private:
 
     void worker_thread_loop(const uint32_t worker_id)
     {
-        std::this_thread::sleep_for(std::chrono::milliseconds(START_SLEEP_MS));
-        
         uint32_t loop_round = 0;
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
@@ -267,8 +262,6 @@ private:
         const uint32_t total_workers = thread_count_ - 1;
 
         depth_dynamic_worker_lower_bound.fill(1);
-
-        std::this_thread::sleep_for(std::chrono::milliseconds(START_SLEEP_MS));
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
         {
