@@ -184,7 +184,11 @@ private:
         }
         else
         {
-            if (processed)
+            if (processed ==  MAX_PROCESS_TASKS)
+            {
+                backoff.double_decay();
+            }
+            else if (processed)
             {
                 backoff.decay();
             }
@@ -193,10 +197,11 @@ private:
                 tree_ptr_->deal_with_local_stack();
                 backoff.decay();
             }
-            else
+            else if(depth_worker_count[depth].load(std::memory_order_relaxed) > 1)
             {
-                backoff.backoff();
+                backoff.decay();
             }
+            
             return false;
         }
     }
