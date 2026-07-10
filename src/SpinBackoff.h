@@ -38,6 +38,12 @@ public:
         backoff_ = (backoff_ > 1) ? backoff_ / 2 : 1; // backoff 也指数衰减
     }
 
+    void double_decay()
+    {
+        count_ >>= 2;          // 阶段计数器双倍指数衰减
+        backoff_ = (backoff_ > 1) ? backoff_ / 4 : 1; // backoff 也双倍指数衰减
+    }
+
     void reset()
     {
         count_ = 0;
