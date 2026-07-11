@@ -7,6 +7,7 @@
 #include "../include/xxh3.h"
 #include "HashFunction.h"
 #include "../include/rapidhash.h"
+#include "ConcurrentMapWriter.h"
 
 #include <array>
 #include <atomic>
@@ -17,6 +18,8 @@
 #include <memory>
 #include <new>
 #include <vector>
+#include <utility>
+#include <mutex>
 
 template <uint32_t N>
 struct concurrent_node
@@ -64,23 +67,45 @@ class ConcurrentMap
     }
 
     static constexpr size_t NODE_SLOT_STRIDE = align_up(sizeof(concurrent_node<N>), alignof(concurrent_node<N>));
-    static constexpr size_t SLOTS_PER_BLOCK = KMER_BLOCK_SIZE / NODE_SLOT_STRIDE;
-
-    static_assert(SLOTS_PER_BLOCK > 0, "KMER_BLOCK_SIZE too small for aligned concurrent_node slots");
 
     const uint64_t capacity;
     const uint64_t mod;
     ConcurrentMemoryPool* memory_pool = nullptr;
     bucket<N>* buckets;
-    alignas(64) std::atomic<uint64_t> map_size{};
+    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> map_size{};
 
     // 新的 thread-local 状态（顺序分配 + 单槽回收）
+    inline static thread_local int thread_id = -1;
     inline static thread_local std::byte* cur_block_ = nullptr;           // 当前 4KB block
     inline static thread_local uint32_t cur_slot_ = 0;                    // 当前 block 已用槽位
     inline static thread_local concurrent_node<N>* waste_slot_ = nullptr; // CAS 失败回收槽
 
+#ifdef TEST_MODE
+    inline static std::mutex mtx;
+#endif
+
 public:
-    static constexpr uint64_t BUCKET_SIZE = sizeof(bucket<N>);
+
+    static constexpr size_t SLOT_BLOCK_POINTER_NUM = 4;
+    static constexpr size_t BUCKET_SIZE = sizeof(bucket<N>);
+    static constexpr size_t SLOT_HEADER_SIZE = sizeof(void*) * SLOT_BLOCK_POINTER_NUM;
+    static constexpr size_t SLOTS_PER_BLOCK = (KMER_BLOCK_SIZE - SLOT_HEADER_SIZE) / NODE_SLOT_STRIDE;
+
+    static_assert(SLOTS_PER_BLOCK > 0, "KMER_BLOCK_SIZE too small for aligned concurrent_node slots");
+
+    struct slot_block
+    {
+        std::array<slot_block*, SLOT_BLOCK_POINTER_NUM> last_blocks{};
+        std::array<concurrent_node<N>, SLOTS_PER_BLOCK> slots{};
+    };
+
+    using block_pointers_tuple = std::tuple<slot_block*, uint64_t, uint64_t>;
+    inline static std::vector<block_pointers_tuple> block_pointers_vector;
+    inline static uint32_t k_length;
+
+    // 用于回溯填充 last_blocks 的历史缓冲区（最近 4 个已完成块）
+    inline static thread_local std::array<slot_block*, SLOT_BLOCK_POINTER_NUM> tls_recents = { nullptr, nullptr, nullptr, nullptr };
+
 
     // 按元素数量分配桶，并记录线程数
     explicit ConcurrentMap(const uint64_t in_capacity, char* bucket_memory, ConcurrentMemoryPool* in_memory_pool)
@@ -95,13 +120,111 @@ public:
     // 析构：释放桶数组
     ~ConcurrentMap() = default;
 
+    static void set_thread_num(uint32_t num_threads)
+    {
+        block_pointers_vector.resize(num_threads);
+        for (uint32_t i = 0;i < num_threads;i++)
+        {
+            std::get<0>(block_pointers_vector[i]) = nullptr;
+            std::get<1>(block_pointers_vector[i]) = 0;
+            std::get<2>(block_pointers_vector[i]) = 0;
+        }
+    }
+
+    static void set_thread_id(uint32_t id)
+    {
+        thread_id = id;
+    }
+
+    static void set_k_length(uint32_t k_len)
+    {
+        k_length = k_len;
+    }
+
+    static void add_thread_node_count(uint64_t count)
+    {
+        std::get<1>(block_pointers_vector[thread_id]) += count;
+    }
+
     // 哈希：将 k-mer 映射到桶索引
-    uint64_t hash_func(const kmer<N>& k_mer) const
+    static uint64_t hash_func(const kmer<N>& k_mer)
     {
         const uint64_t h1 = XXH3_64bits(&k_mer, sizeof(kmer<N>));
         const uint64_t h2 = rapidhash(&k_mer, sizeof(kmer<N>));
         const uint64_t res = mix_hash(h1, h2);
         return res;
+    }
+
+    static void export_thread_node_count(ConcurrentMapWriter& writer, const int goal_thread_id)
+    {
+        const uint64_t full_words = k_length / BASES_PER_U64T;
+        const uint64_t tail_bits = 2 * (k_length % BASES_PER_U64T);
+        uint64_t remaining = std::get<1>(block_pointers_vector[goal_thread_id]);
+        slot_block* block_ptr = std::get<0>(block_pointers_vector[goal_thread_id]);
+        uint64_t block_count = std::get<2>(block_pointers_vector[goal_thread_id]);
+
+#ifdef TEST_MODE
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            std::cout << "Thread " << goal_thread_id << " has " << remaining << " nodes in " << block_count << " blocks." << std::endl;
+        }
+#endif
+
+        if (remaining == 0 || block_ptr == nullptr) return;
+
+        for (int i = 0;i < SLOT_BLOCK_POINTER_NUM;i++)
+        {
+            if (block_ptr == nullptr) break;
+            __builtin_prefetch(block_ptr->last_blocks[i], 0, 0);
+        }
+        uint64_t first_block_count;
+
+        if (block_count > 1)
+        {
+            if ((block_count - 1) * SLOTS_PER_BLOCK < remaining)
+            {
+                first_block_count = remaining - (block_count - 1) * SLOTS_PER_BLOCK;
+            }
+            else
+            {
+                first_block_count = 0;
+            }
+        }
+        else
+        {
+            first_block_count = remaining;
+        }
+
+        if (first_block_count > 0) [[likely]]
+        {
+            for (uint64_t i = 0; i < first_block_count; i++)
+            {
+                writer.write_kmer_record(&block_ptr->slots[i].k_mer.data[0], full_words, tail_bits, block_ptr->slots[i].count.load(std::memory_order_relaxed));
+            }
+            remaining -= first_block_count;
+        }
+
+        block_ptr = block_ptr->last_blocks[0];
+        if (block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1] != nullptr)
+        {
+            __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
+        }
+
+        while (remaining > 0)
+        {
+            if (block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1] != nullptr) [[likely]]
+            {
+                __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
+            }
+
+            for (uint64_t i = 0; i < SLOTS_PER_BLOCK; i++)
+            {
+                writer.write_kmer_record(&block_ptr->slots[i].k_mer.data[0], full_words, tail_bits, block_ptr->slots[i].count.load(std::memory_order_relaxed));
+            }
+            remaining -= SLOTS_PER_BLOCK;
+            block_ptr = block_ptr->last_blocks[0];
+        }
+
     }
 
     void increment(const kmer<N>& k_mer, uint64_t& local_size_count, const uint32_t& count = 1)
@@ -251,8 +374,18 @@ private:
         // 2. 从 cur_block 顺序分配
         if (cur_block_ == nullptr || cur_slot_ >= SLOTS_PER_BLOCK)
         {
-            cur_block_ = static_cast<std::byte*>(memory_pool->allocate());
+            slot_block* new_block = reinterpret_cast<slot_block*>(memory_pool->allocate());
             cur_slot_ = 0;
+
+            std::get<0>(block_pointers_vector[thread_id]) = new_block;
+            std::get<2>(block_pointers_vector[thread_id])++;
+
+            new_block->last_blocks = tls_recents;
+
+            std::memmove(tls_recents.data() + 1, tls_recents.data(), sizeof(slot_block*) * (SLOT_BLOCK_POINTER_NUM - 1));
+            tls_recents[0] = new_block;
+
+            cur_block_ = reinterpret_cast<std::byte*>(new_block) + SLOT_HEADER_SIZE; // 跳过头部指针区域
         }
 
         std::byte* slot = cur_block_ + (cur_slot_ * NODE_SLOT_STRIDE);

@@ -15,6 +15,7 @@
 #include "RingMemoryPool.h"
 #include "CountingHashMap.h"
 #include "../sort/ExportRecordRadixSort.h"
+#include "ConcurrentMapWriter.h"
 
 #include <atomic>
 #include <vector>
@@ -447,7 +448,7 @@ public:
         export_ring_pool->producer_set_finished();
     }
 
-    void final_drain_parallel(uint32_t worker_count)
+    void final_drain_parallel(uint32_t worker_count, const uint32_t tasker_worker_num)
     {
         constexpr uint64_t root_num = 1ULL << (2 * ROOT_BASES);
         if (worker_count == 0)
@@ -462,12 +463,15 @@ public:
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
 
+        std::atomic<int> concurrent_map_index{ 0 };
+
         for (uint32_t i = 0; i < worker_count; ++i)
         {
 
-            workers.emplace_back([this, i]()
+            workers.emplace_back([&concurrent_map_index, i, this, worker_count, tasker_worker_num]()
                 {
                     FinalDrainWriter writer;
+                    ConcurrentMap<N>::set_thread_id(i + tasker_worker_num);
                     auto final_drain_queue = layer_queue_->get_final_drain_queue();
                     Task<N> task;
                     while (final_drain_queue->try_dequeue(task))
@@ -476,7 +480,22 @@ public:
                         writer.open(root_index);
                         final_drain_root(task.current_node, writer);
                         writer.close();
-                    } });
+                    }
+
+                    ConcurrentMapWriter map_writer;
+                    map_writer.open(i);
+                    ConcurrentMap<N>::export_thread_node_count(map_writer, i + tasker_worker_num);
+
+                    int cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
+                    while (cur_concurrent_map_index < tasker_worker_num)
+                    {
+                        ConcurrentMap<N>::export_thread_node_count(map_writer, cur_concurrent_map_index);
+                        cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    map_writer.close();
+
+                });
         }
 
         for (auto& t : workers)
@@ -526,6 +545,7 @@ private:
         }
 
         flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+        hash_map->add_thread_node_count(local_size_count);
         hash_map->add_size(local_size_count);
     }
 
@@ -864,7 +884,7 @@ private:
                         insert_kmer_in_task_to_node_hash_map_without_local_hash_map(task);
                         current->count = 0;
                         current->active_block = nullptr;
-                        export_hash_map(writer, hash_map);
+                        // export_hash_map(writer, hash_map);
                     }
                     else
                     {
@@ -876,7 +896,7 @@ private:
                     if (hash_map != nullptr)
                     {
                         // Edge case: has hash map but no pending k-mers in blocks, still need to export hash map contents
-                        export_hash_map(writer, hash_map);
+                        // export_hash_map(writer, hash_map);
                     }
                 }
                 continue;

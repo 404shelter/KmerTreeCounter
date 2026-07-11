@@ -6,6 +6,7 @@
 #include "SPSCRingQueue.h"
 #include "NewKmerTree.h"
 #include "../src/SpinBackoff.h"
+#include "ConcurrentMap.h"
 
 #include <memory>
 #include <vector>
@@ -184,7 +185,7 @@ private:
         }
         else
         {
-            if (processed ==  MAX_PROCESS_TASKS)
+            if (processed == MAX_PROCESS_TASKS)
             {
                 backoff.double_decay();
             }
@@ -197,11 +198,11 @@ private:
                 tree_ptr_->deal_with_local_stack();
                 backoff.decay();
             }
-            else if(depth_worker_count[depth].load(std::memory_order_relaxed) > 1)
+            else if (depth_worker_count[depth].load(std::memory_order_relaxed) > 1)
             {
                 backoff.decay();
             }
-            
+
             return false;
         }
     }
@@ -219,6 +220,7 @@ private:
 
     void worker_thread_loop(const uint32_t worker_id)
     {
+        ConcurrentMap<N>::set_thread_id(worker_id);
         uint32_t loop_round = 0;
 
         while (!stop_requested_.load(std::memory_order_acquire) || !all_producers_done())
