@@ -468,7 +468,7 @@ public:
         for (uint32_t i = 0; i < worker_count; ++i)
         {
 
-            workers.emplace_back([&]()
+            workers.emplace_back([&concurrent_map_index, i, this, worker_count, tasker_worker_num]()
                 {
                     FinalDrainWriter writer;
                     ConcurrentMap<N>::set_thread_id(i + tasker_worker_num);
@@ -482,11 +482,12 @@ public:
                         writer.close();
                     }
 
-                    int cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
                     ConcurrentMapWriter map_writer;
                     map_writer.open(i);
+                    ConcurrentMap<N>::export_thread_node_count(map_writer, i + tasker_worker_num);
 
-                    while (cur_concurrent_map_index < worker_count + tasker_worker_num)
+                    int cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
+                    while (cur_concurrent_map_index < tasker_worker_num)
                     {
                         ConcurrentMap<N>::export_thread_node_count(map_writer, cur_concurrent_map_index);
                         cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);

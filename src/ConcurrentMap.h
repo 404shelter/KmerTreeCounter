@@ -85,7 +85,7 @@ public:
     static constexpr size_t SLOT_BLOCK_POINTER_NUM = 4;
     static constexpr size_t BUCKET_SIZE = sizeof(bucket<N>);
     static constexpr size_t SLOT_HEADER_SIZE = sizeof(void*) * SLOT_BLOCK_POINTER_NUM;
-    static constexpr size_t SLOTS_PER_BLOCK = (KMER_BLOCK_SIZE - sizeof(void*) * SLOT_BLOCK_POINTER_NUM) / NODE_SLOT_STRIDE;
+    static constexpr size_t SLOTS_PER_BLOCK = (KMER_BLOCK_SIZE - SLOT_HEADER_SIZE) / NODE_SLOT_STRIDE;
 
     static_assert(SLOTS_PER_BLOCK > 0, "KMER_BLOCK_SIZE too small for aligned concurrent_node slots");
 
@@ -95,8 +95,8 @@ public:
         std::array<concurrent_node<N>, SLOTS_PER_BLOCK> slots{};
     };
 
-    using block_pointers_pair = std::pair<slot_block*, uint64_t>;
-    inline static std::vector<block_pointers_pair> block_pointers_vector;
+    using block_pointers_tuple = std::tuple<slot_block*, uint64_t, uint64_t>;
+    inline static std::vector<block_pointers_tuple> block_pointers_vector;
     inline static uint32_t k_length;
 
     // 用于回溯填充 last_blocks 的历史缓冲区（最近 4 个已完成块）
@@ -121,7 +121,9 @@ public:
         block_pointers_vector.resize(num_threads);
         for (uint32_t i = 0;i < num_threads;i++)
         {
-            block_pointers_vector[i] = { nullptr, 0 };
+            std::get<0>(block_pointers_vector[i]) = nullptr;
+            std::get<1>(block_pointers_vector[i]) = 0;
+            std::get<2>(block_pointers_vector[i]) = 0;
         }
     }
 
@@ -137,7 +139,7 @@ public:
 
     static void add_thread_node_count(uint64_t count)
     {
-        block_pointers_vector[thread_id].second += count;
+        std::get<1>(block_pointers_vector[thread_id]) += count;
     }
 
     // 哈希：将 k-mer 映射到桶索引
@@ -153,14 +155,38 @@ public:
     {
         const uint64_t full_words = k_length / BASES_PER_U64T;
         const uint64_t tail_bits = 2 * (k_length % BASES_PER_U64T);
-        uint64_t remaining = block_pointers_vector[goal_thread_id].second;
-        slot_block* block_ptr = block_pointers_vector[goal_thread_id].first;
+        uint64_t remaining = std::get<1>(block_pointers_vector[goal_thread_id]);
+        slot_block* block_ptr = std::get<0>(block_pointers_vector[goal_thread_id]);
+        uint64_t block_count = std::get<2>(block_pointers_vector[goal_thread_id]);
+
+#ifdef TEST_MODE
+        std::cout << "Thread " << goal_thread_id << " has " << remaining << " nodes in " << block_count << " blocks." << std::endl;
+#endif
+
+        if (remaining == 0 || block_ptr == nullptr) return;
+
         for (int i = 0;i < SLOT_BLOCK_POINTER_NUM;i++)
         {
             if (block_ptr == nullptr) break;
             __builtin_prefetch(block_ptr->last_blocks[i], 0, 0);
         }
-        const uint64_t first_block_count = remaining % SLOTS_PER_BLOCK;
+        uint64_t first_block_count;
+
+        if (block_count > 1)
+        {
+            if ((block_count - 1) * SLOTS_PER_BLOCK < remaining)
+            {
+                first_block_count = remaining - (block_count - 1) * SLOTS_PER_BLOCK;
+            }
+            else
+            {
+                first_block_count = 0;
+            }
+        }
+        else
+        {
+            first_block_count = remaining;
+        }
 
         if (first_block_count > 0) [[likely]]
         {
@@ -172,7 +198,10 @@ public:
         }
 
         block_ptr = block_ptr->last_blocks[0];
-        __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
+        if (block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1] != nullptr)
+        {
+            __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
+        }
 
         while (remaining > 0)
         {
@@ -341,7 +370,8 @@ private:
             slot_block* new_block = reinterpret_cast<slot_block*>(memory_pool->allocate());
             cur_slot_ = 0;
 
-            block_pointers_vector[thread_id].first = new_block;
+            std::get<0>(block_pointers_vector[thread_id]) = new_block;
+            std::get<2>(block_pointers_vector[thread_id])++;
 
             new_block->last_blocks = tls_recents;
 
