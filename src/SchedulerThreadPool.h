@@ -174,6 +174,7 @@ private:
     // 所有 depth 切换全部由 try_switch_depth 完成
     bool try_switch_depth(const uint32_t worker_id, const uint32_t depth)
     {
+        const max_process_task = (depth + 1 == INVALID_DEPTH) ? MAX_PROCESS_TASKS / 2 : MAX_PROCESS_TASKS;
         uint32_t processed = process_batch_at_depth(depth);
 
         uint32_t new_depth = worker_commands_[worker_id].exchange(INVALID_DEPTH, std::memory_order_acq_rel);
