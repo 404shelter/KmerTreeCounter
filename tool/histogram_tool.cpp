@@ -233,8 +233,26 @@ namespace
     }
 
     template <uint32_t N>
-    [[nodiscard]] std::vector<RootFileInfo> collect_root_files(const std::string& tmp_dir, uint64_t& expected_unique_insert)
+    [[nodiscard]] uint64_t packed_kmer_bytes_for_k(const uint32_t k_len)
     {
+        const uint64_t full_data_count = k_len / BASES_PER_U64T;
+        const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
+        const uint64_t tail_bytes = (tail_bits + 7ULL) / 8ULL;
+        const uint64_t packed_kmer_bytes = full_data_count * sizeof(uint64_t) + tail_bytes;
+        if (packed_kmer_bytes == 0 || k_len > N * BASES_PER_U64T) [[unlikely]]
+        {
+            std::cerr << "invalid k-mer length for packed byte calculation: " << k_len << std::endl;
+            exit(-1);
+        }
+        return packed_kmer_bytes;
+    }
+
+    template <uint32_t N>
+    [[nodiscard]] std::vector<RootFileInfo> collect_root_files(
+        const std::string& tmp_dir, uint64_t& expected_unique_insert, uint32_t k_len)
+    {
+        const uint64_t compact_record_size = packed_kmer_bytes_for_k<N>(k_len) + sizeof(uint32_t);
+
         std::vector<RootFileInfo> root_files;
         root_files.reserve(ROOT_BUCKET_COUNT);
         expected_unique_insert = 0;
@@ -265,13 +283,13 @@ namespace
             close_fd(fd);
 
             const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-            if (file_size % sizeof(ExportRecord<N>) != 0)
+            if (file_size % compact_record_size != 0)
             {
                 std::cerr << "invalid root file size for " << filename << std::endl;
                 exit(-1);
             }
 
-            const uint64_t record_count = file_size / sizeof(ExportRecord<N>);
+            const uint64_t record_count = file_size / compact_record_size;
             expected_unique_insert = expected_unique_insert + record_count;
             if (record_count > 0)
             {
@@ -280,21 +298,6 @@ namespace
         }
 
         return root_files;
-    }
-
-    template <uint32_t N>
-    [[nodiscard]] uint64_t packed_kmer_bytes_for_k(const uint32_t k_len)
-    {
-        const uint64_t full_data_count = k_len / BASES_PER_U64T;
-        const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
-        const uint64_t tail_bytes = (tail_bits + 7ULL) / 8ULL;
-        const uint64_t packed_kmer_bytes = full_data_count * sizeof(uint64_t) + tail_bytes;
-        if (packed_kmer_bytes == 0 || k_len > N * BASES_PER_U64T) [[unlikely]]
-        {
-            std::cerr << "invalid k-mer length for packed byte calculation: " << k_len << std::endl;
-            exit(-1);
-        }
-        return packed_kmer_bytes;
     }
 
     template <uint32_t N>
@@ -355,15 +358,17 @@ namespace
     void enqueue_high_records(
         const std::vector<RootFileInfo>& root_files,
         SPMCRingMemoryPool<HISTOGRAM_RING_CAPACITY>& pool,
+        uint32_t k_len,
         ProgressPrinter* progress)
     {
         using Record = ExportRecord<N>;
         constexpr uint64_t RECORDS_PER_BLOCK = HISTOGRAM_BLOCK_BYTES / sizeof(Record);
         static_assert(RECORDS_PER_BLOCK > 0, "histogram high-frequency block is too small");
+        const uint64_t compact_rec_size = packed_kmer_bytes_for_k<N>(k_len) + sizeof(uint32_t);
 
         for (const RootFileInfo& root_file : root_files)
         {
-            FinalDrainReader<N> reader;
+            FinalDrainReader<N> reader(k_len);
             reader.open(root_file.filename);
 
             while (!reader.finished())
@@ -377,7 +382,7 @@ namespace
                     pool.consumer_enqueue(block_ptr);
                     break;
                 }
-                progress->add(count * sizeof(Record));
+                progress->add(count * compact_rec_size);
 
                 pool.producer_enqueue(content_type{ block_ptr, count });
             }
@@ -451,7 +456,7 @@ namespace
         const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
 
         uint64_t expected_unique_insert = 0;
-        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert);
+        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
         uint64_t high_file_bytes = 0;
         for (const RootFileInfo& root_file : root_files)
         {
@@ -492,7 +497,7 @@ namespace
                 hist_size);
 
             high_threads.start();
-            enqueue_high_records<N>(root_files, high_pool, &progress);
+            enqueue_high_records<N>(root_files, high_pool, options.k_len, &progress);
             high_threads.join();
 
             if (high_threads.insert_failed())
@@ -556,7 +561,7 @@ namespace
         const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
 
         uint64_t expected_unique_insert = 0;
-        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert);
+        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
         uint64_t high_file_bytes = 0;
         for (const RootFileInfo& root_file : root_files)
         {
@@ -582,7 +587,7 @@ namespace
                 hist_size);
 
             approximate_threads.start();
-            enqueue_high_records<N>(root_files, approximate_pool, &progress);
+            enqueue_high_records<N>(root_files, approximate_pool, options.k_len, &progress);
             approximate_threads.join();
         }
 

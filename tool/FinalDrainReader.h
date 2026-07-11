@@ -21,13 +21,15 @@ template <uint32_t N>
 class FinalDrainReader
 {
     constexpr static uint64_t RAW_BUFFER_SIZE = 512 * 1024;
-    constexpr static uint64_t RECORD_SIZE = sizeof(ExportRecord<N>);
-    constexpr static uint64_t BUFFER_RECORD_CAPACITY = RAW_BUFFER_SIZE / RECORD_SIZE;
-    constexpr static uint64_t BUFFER_BYTES = BUFFER_RECORD_CAPACITY * RECORD_SIZE;
-
-    static_assert(BUFFER_RECORD_CAPACITY > 0, "ExportRecord is larger than FinalDrainReader raw buffer");
 
     int fd = -1;
+    uint32_t k_length;
+    uint64_t kmer_bytes;           // compact k-mer bytes in file
+    uint64_t compact_record_size;  // kmer_bytes + sizeof(uint32_t)
+    uint64_t full_words;
+    uint64_t tail_bits;
+    uint64_t tail_bytes;
+
     uint64_t record_amount = 0;
     uint64_t scheduled_record_count = 0;
     uint64_t delivered_record_count = 0;
@@ -39,8 +41,15 @@ class FinalDrainReader
     std::array<uint64_t, 2> buffer_cursor{};
 
 public:
-    FinalDrainReader()
+    explicit FinalDrainReader(uint32_t k)
+        : k_length(k)
     {
+        full_words = k_length / BASES_PER_U64T;
+        tail_bits = 2 * (k_length % BASES_PER_U64T);
+        tail_bytes = (tail_bits + 7) / 8;
+        kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
+        compact_record_size = kmer_bytes + sizeof(uint32_t);
+
         for (uint32_t i = 0; i < 2; ++i)
         {
             std::memset(&cbs[i], 0, sizeof(struct aiocb));
@@ -79,17 +88,17 @@ public:
         }
 
         const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-        if (file_size % RECORD_SIZE != 0) [[unlikely]]
+        if (file_size % compact_record_size != 0) [[unlikely]]
         {
             std::cerr << "Invalid final drain file size: " << file_size
-                << " is not divisible by ExportRecord size "
-                << RECORD_SIZE << std::endl;
+                << " is not divisible by compact record size "
+                << compact_record_size << std::endl;
             std::exit(-1);
         }
 
         ::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 
-        record_amount = file_size / RECORD_SIZE;
+        record_amount = file_size / compact_record_size;
         scheduled_record_count = 0;
         delivered_record_count = 0;
         current_buffer_index = 0;
@@ -99,7 +108,7 @@ public:
             std::memset(&cbs[i], 0, sizeof(struct aiocb));
             if (buffer[i] == nullptr)
             {
-                buffer[i] = new char[BUFFER_BYTES];
+                buffer[i] = new char[RAW_BUFFER_SIZE];
             }
             cbs_active[i] = false;
             buffer_record_count[i] = 0;
@@ -148,6 +157,7 @@ public:
         return delivered_record_count >= record_amount;
     }
 
+    // Read compact records from file, expand to full ExportRecord<N> in memory
     uint64_t read_records(ExportRecord<N>* out_buffer, uint64_t max_records_to_read)
     {
         if (finished()) [[unlikely]]
@@ -180,8 +190,31 @@ public:
             }
 
             const uint64_t to_copy = std::min(max_records_to_read - total_read, available);
-            const char* src = buffer[idx] + buffer_cursor[idx] * RECORD_SIZE;
-            std::memcpy(out_buffer + total_read, src, static_cast<size_t>(to_copy * RECORD_SIZE));
+
+            // Expand compact records to full ExportRecord<N>
+            for (uint64_t i = 0; i < to_copy; ++i)
+            {
+                const char* src = buffer[idx] + buffer_cursor[idx] * compact_record_size + i * compact_record_size;
+                ExportRecord<N>& dst = out_buffer[total_read + i];
+
+                // Zero out the full k-mer first
+                dst.key.reset();
+
+                // Copy full uint64_t words
+                std::memcpy(dst.key.data.data(), src, full_words * sizeof(uint64_t));
+
+                // Copy tail bytes and expand to uint64_t (MSB-aligned)
+                if (tail_bytes > 0)
+                {
+                    uint64_t tail_data = 0;
+                    std::memcpy(reinterpret_cast<char*>(&tail_data) + (8 - tail_bytes),
+                                src + full_words * sizeof(uint64_t), tail_bytes);
+                    dst.key.data[full_words] = tail_data;
+                }
+
+                // Copy 32-bit count
+                std::memcpy(&dst.count, src + kmer_bytes, sizeof(uint32_t));
+            }
 
             buffer_cursor[idx] += to_copy;
             delivered_record_count += to_copy;
@@ -207,23 +240,24 @@ private:
         }
 
         const uint64_t remaining = record_amount - scheduled_record_count;
-        const uint64_t read_count = std::min(BUFFER_RECORD_CAPACITY, remaining);
+        const uint64_t buffer_capacity = RAW_BUFFER_SIZE / compact_record_size;
+        const uint64_t read_count = std::min(buffer_capacity, remaining);
         if (read_count == 0)
         {
             return;
         }
 
-        const uint64_t read_bytes = read_count * RECORD_SIZE;
-        const uint64_t read_offset = scheduled_record_count * RECORD_SIZE;
+        const uint64_t read_bytes = read_count * compact_record_size;
+        const uint64_t read_offset = scheduled_record_count * compact_record_size;
+
+        buffer_record_count[buffer_index] = read_count;
+        buffer_cursor[buffer_index] = 0;
 
         std::memset(&cbs[buffer_index], 0, sizeof(struct aiocb));
         cbs[buffer_index].aio_fildes = fd;
         cbs[buffer_index].aio_buf = buffer[buffer_index];
-        cbs[buffer_index].aio_nbytes = static_cast<size_t>(read_bytes);
+        cbs[buffer_index].aio_nbytes = read_bytes;
         cbs[buffer_index].aio_offset = static_cast<off_t>(read_offset);
-
-        buffer_record_count[buffer_index] = read_count;
-        buffer_cursor[buffer_index] = 0;
 
         if (::aio_read(&cbs[buffer_index]) != 0) [[unlikely]]
         {
@@ -231,13 +265,13 @@ private:
             std::exit(-1);
         }
 
-        scheduled_record_count += read_count;
         cbs_active[buffer_index] = true;
+        scheduled_record_count += read_count;
     }
 
-    void wait_read_finish(uint32_t buffer_index)
+    void wait_read_finish(const uint32_t buffer_index)
     {
-        if (!cbs_active[buffer_index])
+        if (!cbs_active[buffer_index]) [[unlikely]]
         {
             return;
         }
@@ -256,13 +290,12 @@ private:
         err = ::aio_error(&cbs[buffer_index]);
         if (err != 0) [[unlikely]]
         {
-            std::cerr << "aio_read error" << std::endl;
+            std::cerr << "aio_read error: " << err << std::endl;
             std::exit(-1);
         }
 
-        const uint64_t expected_bytes = buffer_record_count[buffer_index] * RECORD_SIZE;
-        const ssize_t n = ::aio_return(&cbs[buffer_index]);
-        if (n != static_cast<ssize_t>(expected_bytes)) [[unlikely]]
+        ssize_t n = ::aio_return(&cbs[buffer_index]);
+        if (n != static_cast<ssize_t>(cbs[buffer_index].aio_nbytes)) [[unlikely]]
         {
             std::cerr << "partial aio_read" << std::endl;
             std::exit(-1);
