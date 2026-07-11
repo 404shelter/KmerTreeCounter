@@ -19,6 +19,7 @@
 #include <new>
 #include <vector>
 #include <utility>
+#include <mutex>
 
 template <uint32_t N>
 struct concurrent_node
@@ -79,6 +80,9 @@ class ConcurrentMap
     inline static thread_local uint32_t cur_slot_ = 0;                    // 当前 block 已用槽位
     inline static thread_local concurrent_node<N>* waste_slot_ = nullptr; // CAS 失败回收槽
 
+#ifdef TEST_MODE
+    inline static std::mutex mtx;
+#endif
 
 public:
 
@@ -160,7 +164,10 @@ public:
         uint64_t block_count = std::get<2>(block_pointers_vector[goal_thread_id]);
 
 #ifdef TEST_MODE
-        std::cout << "Thread " << goal_thread_id << " has " << remaining << " nodes in " << block_count << " blocks." << std::endl;
+        {
+            std::lock_guard<std::mutex> lock(mtx);
+            std::cout << "Thread " << goal_thread_id << " has " << remaining << " nodes in " << block_count << " blocks." << std::endl;
+        }
 #endif
 
         if (remaining == 0 || block_ptr == nullptr) return;
