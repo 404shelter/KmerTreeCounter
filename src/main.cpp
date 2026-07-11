@@ -228,6 +228,7 @@ int process_main()
     pool->init_arenas();
     //pool->perform_first_touch(n_thread);
     ConcurrentMap<N>::set_thread_num(std::max(1U, tasker_num - 1U) + n_thread);
+    ConcurrentMap<N>::set_k_length(k_len);
     // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
     auto tree = std::make_shared<KmerTree<N>>(k_len, pool.get(), layer_queues.get(), export_ring_pool.get());
     // 初始化布隆过滤器的MPSC队列
@@ -298,7 +299,7 @@ int process_main()
     const auto final_start = std::chrono::steady_clock::now();
 
     // Final drain 阶段：多线程并行遍历整个字典树，将在节点中暂存但未下发的 k-mers 全部合并到全局哈希表中
-    tree->final_drain_parallel(n_thread);
+    tree->final_drain_parallel(n_thread, std::max(1U, tasker_num - 1U));
 
     std::cout << "Total read k-mer count: " << parser_thread_pool->get_total_read_kmer() << std::endl;
 

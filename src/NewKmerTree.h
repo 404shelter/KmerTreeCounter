@@ -15,6 +15,7 @@
 #include "RingMemoryPool.h"
 #include "CountingHashMap.h"
 #include "../sort/ExportRecordRadixSort.h"
+#include "ConcurrentMapWriter.h"
 
 #include <atomic>
 #include <vector>
@@ -447,7 +448,7 @@ public:
         export_ring_pool->producer_set_finished();
     }
 
-    void final_drain_parallel(uint32_t worker_count)
+    void final_drain_parallel(uint32_t worker_count, const uint32_t tasker_worker_num)
     {
         constexpr uint64_t root_num = 1ULL << (2 * ROOT_BASES);
         if (worker_count == 0)
@@ -462,12 +463,15 @@ public:
         std::vector<std::thread> workers;
         workers.reserve(worker_count);
 
+        std::atomic<int> concurrent_map_index{ 0 };
+
         for (uint32_t i = 0; i < worker_count; ++i)
         {
 
-            workers.emplace_back([this, i]()
+            workers.emplace_back([&]()
                 {
                     FinalDrainWriter writer;
+                    ConcurrentMap<N>::set_thread_id(i + tasker_worker_num);
                     auto final_drain_queue = layer_queue_->get_final_drain_queue();
                     Task<N> task;
                     while (final_drain_queue->try_dequeue(task))
@@ -476,7 +480,21 @@ public:
                         writer.open(root_index);
                         final_drain_root(task.current_node, writer);
                         writer.close();
-                    } });
+                    }
+
+                    int cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
+                    ConcurrentMapWriter map_writer;
+                    map_writer.open(i);
+
+                    while (cur_concurrent_map_index < worker_count + tasker_worker_num)
+                    {
+                        ConcurrentMap<N>::export_thread_node_count(map_writer, cur_concurrent_map_index);
+                        cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    map_writer.close();
+
+                });
         }
 
         for (auto& t : workers)

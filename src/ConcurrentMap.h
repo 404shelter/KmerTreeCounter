@@ -7,6 +7,7 @@
 #include "../include/xxh3.h"
 #include "HashFunction.h"
 #include "../include/rapidhash.h"
+#include "ConcurrentMapWriter.h"
 
 #include <array>
 #include <atomic>
@@ -90,14 +91,15 @@ public:
 
     struct slot_block
     {
-        std::array<slot_block*, SLOT_BLOCK_POINTER_NUM> next_blocks{};
+        std::array<slot_block*, SLOT_BLOCK_POINTER_NUM> last_blocks{};
         std::array<concurrent_node<N>, SLOTS_PER_BLOCK> slots{};
     };
 
     using block_pointers_pair = std::pair<slot_block*, uint64_t>;
-    static std::vector<block_pointers_pair> block_pointers_vector;
+    inline static std::vector<block_pointers_pair> block_pointers_vector;
+    inline static uint32_t k_length;
 
-    // 用于回溯填充 next_blocks 的历史缓冲区（最近 4 个已完成块）
+    // 用于回溯填充 last_blocks 的历史缓冲区（最近 4 个已完成块）
     inline static thread_local std::array<slot_block*, SLOT_BLOCK_POINTER_NUM> tls_recents = { nullptr, nullptr, nullptr, nullptr };
 
 
@@ -128,6 +130,11 @@ public:
         thread_id = id;
     }
 
+    static void set_k_length(uint32_t k_len)
+    {
+        k_length = k_len;
+    }
+
     static void add_thread_node_count(uint64_t count)
     {
         block_pointers_vector[thread_id].second += count;
@@ -140,6 +147,48 @@ public:
         const uint64_t h2 = rapidhash(&k_mer, sizeof(kmer<N>));
         const uint64_t res = mix_hash(h1, h2);
         return res;
+    }
+
+    static void export_thread_node_count(ConcurrentMapWriter& writer, const int goal_thread_id)
+    {
+        const uint64_t full_words = k_length / BASES_PER_U64T;
+        const uint64_t tail_bits = 2 * (k_length % BASES_PER_U64T);
+        uint64_t remaining = block_pointers_vector[goal_thread_id].second;
+        slot_block* block_ptr = block_pointers_vector[goal_thread_id].first;
+        for (int i = 0;i < SLOT_BLOCK_POINTER_NUM;i++)
+        {
+            if (block_ptr == nullptr) break;
+            __builtin_prefetch(block_ptr->last_blocks[i], 0, 0);
+        }
+        const uint64_t first_block_count = remaining % SLOTS_PER_BLOCK;
+
+        if (first_block_count > 0) [[likely]]
+        {
+            for (uint64_t i = 0; i < first_block_count; i++)
+            {
+                writer.write_kmer_record(&block_ptr->slots[i].k_mer.data[0], full_words, tail_bits, block_ptr->slots[i].count.load(std::memory_order_relaxed));
+            }
+            remaining -= first_block_count;
+        }
+
+        block_ptr = block_ptr->last_blocks[0];
+        __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
+
+        while (remaining > 0)
+        {
+            if (block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1] != nullptr) [[likely]]
+            {
+                __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
+            }
+
+            for (uint64_t i = 0; i < SLOTS_PER_BLOCK; i++)
+            {
+                writer.write_kmer_record(&block_ptr->slots[i].k_mer.data[0], full_words, tail_bits, block_ptr->slots[i].count.load(std::memory_order_relaxed));
+            }
+            remaining -= SLOTS_PER_BLOCK;
+            block_ptr = block_ptr->last_blocks[0];
+        }
+
     }
 
     void increment(const kmer<N>& k_mer, uint64_t& local_size_count, const uint32_t& count = 1)
@@ -289,22 +338,17 @@ private:
         // 2. 从 cur_block 顺序分配
         if (cur_block_ == nullptr || cur_slot_ >= SLOTS_PER_BLOCK)
         {
-            cur_block_ = static_cast<std::byte*>(memory_pool->allocate());
+            slot_block* new_block = reinterpret_cast<slot_block*>(memory_pool->allocate());
             cur_slot_ = 0;
 
-            if (cur_block_ == nullptr)
-            {
-                block_pointers_vector[thread_id].first = new_block;
-            }
+            block_pointers_vector[thread_id].first = new_block;
 
-            tls_recents[3] = tls_recents[2];
-            tls_recents[2] = tls_recents[1];
-            tls_recents[1] = tls_recents[0];
+            new_block->last_blocks = tls_recents;
+
+            std::memmove(tls_recents.data() + 1, tls_recents.data(), sizeof(slot_block*) * (SLOT_BLOCK_POINTER_NUM - 1));
             tls_recents[0] = new_block;
 
-            cur_block_->next_blocks=tls_recents;
-
-            cur_block_ += SLOT_HEADER_SIZE; // 跳过头部指针区域
+            cur_block_ = reinterpret_cast<std::byte*>(new_block) + SLOT_HEADER_SIZE; // 跳过头部指针区域
         }
 
         std::byte* slot = cur_block_ + (cur_slot_ * NODE_SLOT_STRIDE);
