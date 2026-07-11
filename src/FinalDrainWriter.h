@@ -70,12 +70,15 @@ public:
         local_sorted_kmer_count = 0;
     }
 
-    template <typename T>
-    std::size_t write(const T& kmer_info)
+    void write_kmer_record(const uint64_t* kmer_data, uint64_t full_words,
+                           uint64_t tail_bits, uint32_t count)
     {
-        //sorted_kmer_count.fetch_add(1, std::memory_order_relaxed);
+        const uint64_t tail_bytes = (tail_bits + 7) / 8;
+        const uint64_t kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
+        const uint32_t total = static_cast<uint32_t>(kmer_bytes + sizeof(uint32_t));
+
         local_sorted_kmer_count++;
-        if (sizeof(T) + buffer_offset > DRAIN_EXPORT_BUFFER_SIZE) [[unlikely]]
+        if (total + buffer_offset > DRAIN_EXPORT_BUFFER_SIZE) [[unlikely]]
         {
             if (!write_all(buffer.data(), buffer_offset)) [[unlikely]]
             {
@@ -84,9 +87,42 @@ public:
             }
             buffer_offset = 0;
         }
-        std::memcpy(buffer.data() + buffer_offset, &kmer_info, sizeof(T));
-        buffer_offset += sizeof(T);
-        return sizeof(T);
+
+        // Write full uint64_t words
+        std::memcpy(buffer.data() + buffer_offset, kmer_data,
+                    full_words * sizeof(uint64_t));
+        buffer_offset += static_cast<int>(full_words * sizeof(uint64_t));
+
+        // Write tail bytes 
+        if (tail_bytes > 0)
+        {
+            uint64_t mask = (~uint64_t{0}) << (64 - tail_bits);
+            uint64_t tail_data = kmer_data[full_words] & mask;
+            std::memcpy(buffer.data() + buffer_offset,
+                        reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes),
+                        tail_bytes);
+            buffer_offset += static_cast<int>(tail_bytes);
+        }
+
+        // Write 32-bit count
+        std::memcpy(buffer.data() + buffer_offset, &count, sizeof(uint32_t));
+        buffer_offset += static_cast<int>(sizeof(uint32_t));
+    }
+
+    // old
+    void write(const void* data, size_t len)
+    {
+        if (len + static_cast<size_t>(buffer_offset) > DRAIN_EXPORT_BUFFER_SIZE) [[unlikely]]
+        {
+            if (!write_all(buffer.data(), buffer_offset)) [[unlikely]]
+            {
+                std::cerr << "Failed to write data" << std::endl;
+                std::exit(-1);
+            }
+            buffer_offset = 0;
+        }
+        std::memcpy(buffer.data() + buffer_offset, data, len);
+        buffer_offset += static_cast<int>(len);
     }
 
 private:

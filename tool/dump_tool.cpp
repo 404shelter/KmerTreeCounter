@@ -548,11 +548,53 @@ namespace
         return bytes_per_kmer;
     }
 
+    // Read compact k-mer records from file and expand to full ExportRecord<N>
+    template <uint32_t N>
+    static uint64_t read_compact_root_records(
+        int fd, uint64_t file_offset, uint64_t count,
+        ExportRecord<N>* out, uint32_t k_len)
+    {
+        const uint64_t full_words = k_len / BASES_PER_U64T;
+        const uint64_t tail_bits = 2ULL * (k_len % BASES_PER_U64T);
+        const uint64_t tail_bytes = (tail_bits + 7) / 8;
+        const uint64_t kmer_bytes = full_words * sizeof(uint64_t) + tail_bytes;
+        const uint64_t compact_rec = kmer_bytes + sizeof(uint32_t);
+
+        const size_t total_bytes = static_cast<size_t>(count * compact_rec);
+        std::vector<char> buf(total_bytes);
+        ssize_t n = ::pread(fd, buf.data(), total_bytes,
+                            static_cast<off_t>(file_offset * compact_rec));
+        if (n != static_cast<ssize_t>(total_bytes))
+        {
+            std::cerr << "short read reading compact root records\n";
+            exit(-1);
+        }
+
+        for (uint64_t i = 0; i < count; ++i)
+        {
+            const char* src = buf.data() + i * compact_rec;
+            ExportRecord<N>& dst = out[i];
+            dst.key.reset();
+            std::memcpy(dst.key.data.data(), src, full_words * sizeof(uint64_t));
+            if (tail_bytes > 0)
+            {
+                uint64_t tail = 0;
+                std::memcpy(reinterpret_cast<char*>(&tail) + (8 - tail_bytes),
+                            src + full_words * sizeof(uint64_t), tail_bytes);
+                dst.key.data[full_words] = tail;
+            }
+            std::memcpy(&dst.count, src + kmer_bytes, sizeof(uint32_t));
+        }
+        return total_bytes;
+    }
+
     // collect root file data
     template <uint32_t N>
     static std::vector<RootFileInfo> collect_root_files(const std::string &tmp_dir,
-                                                        uint64_t &total_records)
+                                                        uint64_t &total_records,
+                                                        uint32_t k_len)
     {
+        const uint64_t compact_rec = packed_kmer_bytes<N>(k_len) + sizeof(uint32_t);
         std::vector<RootFileInfo> files;
         files.reserve(ROOT_BUCKET_COUNT);
         total_records = 0;
@@ -571,12 +613,12 @@ namespace
             ::fstat(fd, &st);
             ::close(fd);
             uint64_t size = static_cast<uint64_t>(st.st_size);
-            if (size % sizeof(ExportRecord<N>) != 0)
+            if (size % compact_rec != 0)
             {
                 std::cerr << "bad root file size: " << path << '\n';
                 exit(-1);
             }
-            uint64_t records = size / sizeof(ExportRecord<N>);
+            uint64_t records = size / compact_rec;
             total_records += records;
             if (records > 0)
                 files.push_back({std::move(path), records, size});
@@ -591,6 +633,7 @@ namespace
                                uint32_t worker_count,
                                uint32_t min_freq,
                                uint32_t max_freq,
+                               uint32_t k_len,
                                ProgressPrinter *progress)
     {
         std::atomic<uint64_t> next_file{0};
@@ -616,14 +659,8 @@ namespace
                 while (remaining > 0)
                 {
                     uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                    size_t bytes = static_cast<size_t>(batch * sizeof(ExportRecord<N>));
-                    ssize_t n = ::pread(fd, buffer.data(), bytes,
-                                        static_cast<off_t>(offset * sizeof(ExportRecord<N>)));
-                    if (n != static_cast<ssize_t>(bytes))
-                    {
-                        std::cerr << "short read\n";
-                        exit(-1);
-                    }
+                    uint64_t bytes = read_compact_root_records<N>(fd, offset, batch,
+                                                                  buffer.data(), k_len);
                     for (uint64_t i = 0; i < batch; ++i)
                         if (in_range(buffer[i].count, min_freq, max_freq))
                             hash_map.insert_unique(buffer[i].key, buffer[i].count);
@@ -916,7 +953,7 @@ namespace
 
         // Collect root file metadata
         uint64_t total_root_records = 0;
-        auto root_files = collect_root_files<N>(opts.tmp_dir, total_root_records);
+        auto root_files = collect_root_files<N>(opts.tmp_dir, total_root_records, opts.k_len);
         uint64_t high_bytes = 0;
         for (auto &rf : root_files)
             high_bytes += rf.file_size;
@@ -957,7 +994,7 @@ namespace
         // build hash map
         FlatConcurrentHashMap<N> hash_map(total_root_records, wc);
         build_hash_map<N>(root_files, hash_map, wc,
-                          opts.min_freq, opts.max_freq, &progress);
+                          opts.min_freq, opts.max_freq, opts.k_len, &progress);
         hash_map.seal();
 
         if (opts.sort_output)
@@ -995,7 +1032,7 @@ namespace
         uint32_t wc = std::max<uint32_t>(1, opts.max_threads);
 
         uint64_t total_records = 0;
-        auto root_files = collect_root_files<N>(opts.tmp_dir, total_records);
+        auto root_files = collect_root_files<N>(opts.tmp_dir, total_records, opts.k_len);
         uint64_t total_bytes = 0;
         for (auto &rf : root_files)
             total_bytes += rf.file_size;
@@ -1033,14 +1070,8 @@ namespace
                     while (remaining > 0)
                     {
                         uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                        size_t bytes = static_cast<size_t>(batch * sizeof(ExportRecord<N>));
-                        ssize_t n = ::pread(fd, buffer.data(), bytes,
-                                            static_cast<off_t>(offset * sizeof(ExportRecord<N>)));
-                        if (n != static_cast<ssize_t>(bytes))
-                        {
-                            std::cerr << "short read\n";
-                            exit(-1);
-                        }
+                        uint64_t bytes = read_compact_root_records<N>(
+                            fd, offset, batch, buffer.data(), opts.k_len);
                         for (uint64_t i = 0; i < batch; ++i)
                             if (in_range(buffer[i].count, opts.min_freq, opts.max_freq))
                                 local.push_back(buffer[i]);
@@ -1100,14 +1131,8 @@ namespace
                     while (remaining > 0)
                     {
                         uint64_t batch = std::min<uint64_t>(remaining, 65536);
-                        size_t bytes = static_cast<size_t>(batch * sizeof(ExportRecord<N>));
-                        ssize_t n = ::pread(fd, buffer.data(), bytes,
-                                            static_cast<off_t>(offset * sizeof(ExportRecord<N>)));
-                        if (n != static_cast<ssize_t>(bytes))
-                        {
-                            std::cerr << "short read\n";
-                            exit(-1);
-                        }
+                        uint64_t bytes = read_compact_root_records<N>(
+                            fd, offset, batch, buffer.data(), opts.k_len);
                         for (uint64_t i = 0; i < batch; ++i)
                             if (in_range(buffer[i].count, opts.min_freq, opts.max_freq))
                                 line_writer.write_line(buffer[i].key, buffer[i].count);

@@ -758,7 +758,7 @@ private:
         }
     }
 
-    /*void final_drain_range(uint64_t begin, uint64_t end, FinalDrainWriter &writer)
+    /*void final_drain_range(uint64_t begin, uint64_t end,  &writer)
     {
         std::vector<DrainFrame> node_stack;
         std::vector<Task<N>> drain_stack;
@@ -1234,8 +1234,10 @@ private:
             return;
         }
 
-        ExportRecord<N> record{ key, count };
-        writer.write(record);
+        const uint64_t full_words = k_length / BASES_PER_U64T;
+        const uint64_t tail_bits = 2 * (k_length % BASES_PER_U64T);
+
+        writer.write_kmer_record(key.data.data(), full_words, tail_bits, count);
     }
 
     void sort_and_export_leaf(node<N>* leaf, FinalDrainWriter& writer)
@@ -1325,7 +1327,6 @@ private:
 
         for (uint64_t i = 0; i < kmer_concurrent_hash_map_capacity; i++)
         {
-            ExportRecord<N> record;
             auto node_ptr = hash_map->bucket_head(i).load(std::memory_order_relaxed);
             while (node_ptr != nullptr)
             {
@@ -1333,9 +1334,9 @@ private:
                 {
                     __builtin_prefetch(node_ptr->next, 0, 0);
                 }
-                record.key = node_ptr->k_mer;
-                record.count = node_ptr->count.load(std::memory_order_relaxed);
-                append_export_record(writer, record.key, record.count);
+                append_export_record(writer, node_ptr->k_mer,
+                    static_cast<uint32_t>(node_ptr->count.load(std::memory_order_relaxed)));
+
                 node_ptr = node_ptr->next;
             }
         }
