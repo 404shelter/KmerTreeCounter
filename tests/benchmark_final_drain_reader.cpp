@@ -12,7 +12,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    FinalDrainReader<2> reader;
+    FinalDrainReader<2> reader(2*32);
     reader.open(argv[1]);
     ExportRecord<2> k_mers[32 * 1024 / sizeof(ExportRecord<2>)];
 
