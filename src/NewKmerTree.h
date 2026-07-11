@@ -526,6 +526,7 @@ private:
         }
 
         flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
+        hash_map->add_thread_node_count(local_size_count);
         hash_map->add_size(local_size_count);
     }
 

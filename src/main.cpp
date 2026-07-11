@@ -227,6 +227,7 @@ int process_main()
     // 确保 Arena 已初始化，才能安全分配内存
     pool->init_arenas();
     //pool->perform_first_touch(n_thread);
+    ConcurrentMap<N>::set_thread_num(std::max(1U, tasker_num - 1U) + n_thread);
     // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
     auto tree = std::make_shared<KmerTree<N>>(k_len, pool.get(), layer_queues.get(), export_ring_pool.get());
     // 初始化布隆过滤器的MPSC队列
