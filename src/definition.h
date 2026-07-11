@@ -1,7 +1,7 @@
 #ifndef TREE_DEFINITION_HEADER
 #define TREE_DEFINITION_HEADER
 
-// #define TEST_MODE
+#define TEST_MODE
 
 #include "SpinLock.h"
 
@@ -168,7 +168,9 @@ alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> sorted_kmer_count{ 0 };
 // 临时文件目录
 inline std::string temp_dir = "./tmp/";
 
-inline uint64_t standard_bloom_filter_capacity = 1ULL << 15; // 最低Bloom Filter容量，单位为元素数量
+// 布隆过滤器最大最小数目
+constexpr uint64_t MIN_BLOOM_FILTER_CAPACITY = 1ULL << 12; // 最低Bloom Filter容量，单位为元素数量
+inline uint64_t MAX_BLOOM_FILTER_CAPACITY = 1ULL << 20;      // 最大Bloom Filter容量，单位为元素数量
 
 // 布隆过滤器的容量
 inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> bloom_filter_capacity;

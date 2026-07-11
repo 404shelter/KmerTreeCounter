@@ -25,6 +25,17 @@ static inline uint64_t finalize(uint64_t h)
     return h;
 }
 
+uint64_t mix_hash(const uint64_t h1,const uint64_t h2)
+{
+    const uint64_t MixFactor = 0x9ddfea08eb382d69ULL;
+    uint64_t a = (h1 ^ h2) * MixFactor;
+    a ^= (a >> 47);
+    uint64_t b = (h2 ^ a) * MixFactor;
+    b ^= (b >> 47);
+    b *= MixFactor;
+    return b;
+}
+
 /**
  * 计算 1~4 个 uint64 元素的哈希值
  * @param arr  数组指针
