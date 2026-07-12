@@ -4,7 +4,7 @@
 #include "definition.h"
 #include "kmer.h"
 #include "ConcurrentMemoryPool.h"
-#include "../include/xxh3.h"
+#include "../include/komihash.h"
 #include "HashFunction.h"
 #include "../include/rapidhash.h"
 #include "FinalDrainWriter.h"
@@ -139,7 +139,7 @@ public:
     // 哈希：将 k-mer 映射到桶索引
     static uint64_t hash_func(const kmer<N>& k_mer)
     {
-        const uint64_t h1 = XXH3_64bits(&k_mer, sizeof(kmer<N>));
+        const uint64_t h1 = komihash(&k_mer, sizeof(kmer<N>), 0);
         const uint64_t h2 = rapidhash(&k_mer, sizeof(kmer<N>));
         const uint64_t res = mix_hash(h1, h2);
         return res;
