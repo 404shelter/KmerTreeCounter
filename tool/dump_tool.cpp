@@ -592,44 +592,6 @@ namespace
         return total_bytes;
     }
 
-    // collect root file data
-    template <uint32_t N>
-    static std::vector<RootFileInfo> collect_root_files(const std::string &tmp_dir,
-                                                        uint64_t &total_records,
-                                                        uint32_t k_len)
-    {
-        const uint64_t compact_rec = packed_kmer_bytes<N>(k_len) + sizeof(uint32_t);
-        std::vector<RootFileInfo> files;
-        files.reserve(ROOT_BUCKET_COUNT);
-        total_records = 0;
-        for (uint64_t id = 0; id < ROOT_BUCKET_COUNT; ++id)
-        {
-            std::string path = root_filename(tmp_dir, id);
-            int fd = ::open(path.c_str(), O_RDONLY);
-            if (fd < 0)
-            {
-                if (errno == ENOENT)
-                    continue;
-                std::cerr << "open failed: " << path << '\n';
-                exit(-1);
-            }
-            struct stat st{};
-            ::fstat(fd, &st);
-            ::close(fd);
-            uint64_t size = static_cast<uint64_t>(st.st_size);
-            if (size % compact_rec != 0)
-            {
-                std::cerr << "bad root file size: " << path << '\n';
-                exit(-1);
-            }
-            uint64_t records = size / compact_rec;
-            total_records += records;
-            if (records > 0)
-                files.push_back({std::move(path), records, size});
-        }
-        return files;
-    }
-
     // collect thread file data
     template <uint32_t N>
     static std::vector<RootFileInfo> collect_thread_files(const std::string &tmp_dir,
@@ -985,11 +947,9 @@ namespace
         uint32_t wc = std::max<uint32_t>(1, opts.max_threads);
         uint64_t pkb = packed_kmer_bytes<N>(opts.k_len);
 
-        // Collect root file metadata
+        // Collect thread file metadata
         uint64_t total_root_records = 0;
-        auto root_files = collect_root_files<N>(opts.tmp_dir, total_root_records, opts.k_len);
-        auto thread_files = collect_thread_files<N>(opts.tmp_dir, total_root_records, opts.k_len);
-        root_files.insert(root_files.end(), thread_files.begin(), thread_files.end());
+        auto root_files = collect_thread_files<N>(opts.tmp_dir, total_root_records, opts.k_len);
         uint64_t high_bytes = 0;
         for (auto &rf : root_files)
             high_bytes += rf.file_size;
@@ -1068,9 +1028,7 @@ namespace
         uint32_t wc = std::max<uint32_t>(1, opts.max_threads);
 
         uint64_t total_records = 0;
-        auto root_files = collect_root_files<N>(opts.tmp_dir, total_records, opts.k_len);
-        auto thread_files = collect_thread_files<N>(opts.tmp_dir, total_records, opts.k_len);
-        root_files.insert(root_files.end(), thread_files.begin(), thread_files.end());
+        auto root_files = collect_thread_files<N>(opts.tmp_dir, total_records, opts.k_len);
         uint64_t total_bytes = 0;
         for (auto &rf : root_files)
             total_bytes += rf.file_size;

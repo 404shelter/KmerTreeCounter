@@ -251,60 +251,7 @@ namespace
         }
         return packed_kmer_bytes;
     }
-
-    template <uint32_t N>
-    [[nodiscard]] std::vector<RootFileInfo> collect_root_files(
-        const std::string& tmp_dir, uint64_t& expected_unique_insert, uint32_t k_len)
-    {
-        const uint64_t compact_record_size = packed_kmer_bytes_for_k<N>(k_len) + sizeof(uint32_t);
-
-        std::vector<RootFileInfo> root_files;
-        root_files.reserve(ROOT_BUCKET_COUNT);
-        expected_unique_insert = 0;
-
-        for (uint64_t root_id = 0; root_id < ROOT_BUCKET_COUNT; ++root_id)
-        {
-            const std::string filename = root_filename(tmp_dir, root_id);
-            const int fd = ::open(filename.c_str(), O_RDONLY);
-            if (fd < 0)
-            {
-                if (errno == ENOENT)
-                {
-                    continue;
-                }
-                std::cerr << "failed to open " << filename << ": " << std::strerror(errno) << std::endl;
-                exit(-1);
-            }
-
-            struct stat st
-            {
-            };
-            if (::fstat(fd, &st) != 0)
-            {
-                close_fd(fd);
-                std::cerr << "failed to stat " << filename << ": " << std::strerror(errno) << std::endl;
-                exit(-1);
-            }
-            close_fd(fd);
-
-            const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-            if (file_size % compact_record_size != 0)
-            {
-                std::cerr << "invalid root file size for " << filename << std::endl;
-                exit(-1);
-            }
-
-            const uint64_t record_count = file_size / compact_record_size;
-            expected_unique_insert = expected_unique_insert + record_count;
-            if (record_count > 0)
-            {
-                root_files.push_back(RootFileInfo{ filename, record_count, file_size });
-            }
-        }
-
-        return root_files;
-    }
-
+    
     template <uint32_t N>
     [[nodiscard]] std::vector<RootFileInfo> collect_thread_files(
         const std::string& tmp_dir, uint64_t& expected_unique_insert, uint32_t k_len)
@@ -492,9 +439,7 @@ namespace
         const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
 
         uint64_t expected_unique_insert = 0;
-        auto root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
-        auto thread_files = collect_thread_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
-        root_files.insert(root_files.end(), thread_files.begin(), thread_files.end());
+        auto root_files = collect_thread_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
         uint64_t high_file_bytes = 0;
         for (const RootFileInfo& root_file : root_files)
         {
@@ -599,9 +544,7 @@ namespace
         const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
 
         uint64_t expected_unique_insert = 0;
-        auto root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
-        auto thread_files = collect_thread_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
-        root_files.insert(root_files.end(), thread_files.begin(), thread_files.end());
+        auto root_files = collect_thread_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
         uint64_t high_file_bytes = 0;
         for (const RootFileInfo& root_file : root_files)
         {
