@@ -238,17 +238,18 @@ public:
         // Write full uint64_t words
         std::memcpy(buffer.data() + buffer_offset, kmer_data,
             full_words * sizeof(uint64_t));
+        buffer_offset += static_cast<int>(full_words * sizeof(uint64_t));
 
         // Write tail bytes 
         uint64_t tail_data = kmer_data[full_words] & mask;
         std::memcpy(buffer.data() + buffer_offset,
             reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes),
             tail_bytes);
+        buffer_offset += static_cast<int>(tail_bytes);
 
         // Write 32-bit count
         std::memcpy(buffer.data() + buffer_offset, &count, sizeof(uint32_t));
-
-        buffer_offset += total_bytes;
+        buffer_offset += sizeof(uint32_t);
     }
 
     void write_map_record(const concurrent_node<N>* nodes, const uint32_t count)
@@ -260,16 +261,18 @@ public:
         {
             std::memcpy(buffer.data() + buffer_offset, nodes[i].k_mer.data.data(),
                 full_words * sizeof(uint64_t));
+            buffer_offset += static_cast<int>(full_words * sizeof(uint64_t));
 
             uint64_t tail_data = nodes[i].k_mer.data[full_words] & mask;
             std::memcpy(buffer.data() + buffer_offset,
                 reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes),
                 tail_bytes);
+            buffer_offset += static_cast<int>(tail_bytes);
 
             const uint32_t record_count = nodes[i].count.load(std::memory_order_relaxed);
             std::memcpy(buffer.data() + buffer_offset, &record_count, sizeof(uint32_t));
+            buffer_offset += sizeof(uint32_t);
         }
-        buffer_offset += first_to_write * total_bytes;
 
         if (first_to_write < count) [[unlikely]]
         {
@@ -284,16 +287,18 @@ public:
             {
                 std::memcpy(buffer.data() + buffer_offset, nodes[i].k_mer.data.data(),
                     full_words * sizeof(uint64_t));
+                buffer_offset += static_cast<int>(full_words * sizeof(uint64_t));
 
                 uint64_t tail_data = nodes[i].k_mer.data[full_words] & mask;
                 std::memcpy(buffer.data() + buffer_offset,
                     reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes),
                     tail_bytes);
+                buffer_offset += static_cast<int>(tail_bytes);
 
                 const uint32_t record_count = nodes[i].count.load(std::memory_order_relaxed);
                 std::memcpy(buffer.data() + buffer_offset, &record_count, sizeof(uint32_t));
+                buffer_offset += sizeof(uint32_t);
             }
-            buffer_offset += (count - first_to_write) * total_bytes;
         }
 
     }
