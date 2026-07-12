@@ -544,7 +544,6 @@ private:
 
         flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
         hash_map->add_thread_node_count(local_size_count);
-        hash_map->add_size(local_size_count);
     }
 
     void insert_kmer_in_task_to_node_hash_map_without_local_hash_map(const Task<N>& current_task)
@@ -566,7 +565,6 @@ private:
             memory_pool->deallocate(input_kmer_block);
         }
         hash_map->add_thread_node_count(local_size_count);
-        hash_map->add_size(local_size_count);
     }
 
     void calculate_block_prefix_counts(kmer_block<N>* block_ptr, const uint32_t depth)
