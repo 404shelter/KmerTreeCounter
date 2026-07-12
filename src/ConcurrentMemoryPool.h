@@ -193,6 +193,9 @@ public:
     // 分配可变大小的块，失败时调用 std::exit(-1)
     void* allocate_large(size_t bytes);
 
+    // 释放 allocate_large 分配的大块内存，按 BLOCK_SIZE 拆分后归还到对应 Arena 的 central_free_list
+    void deallocate_large(void* ptr, uint64_t bytes);
+
     // 释放一个之前分配的块
     void deallocate(void* ptr);
 
@@ -1044,6 +1047,46 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
 
     std::cerr << "std::bad_alloc" << std::endl;
     std::exit(-1);
+}
+
+inline void ConcurrentMemoryPool::deallocate_large(void* ptr, uint64_t bytes)
+{
+    if (!ptr || bytes == 0)
+    {
+        return;
+    }
+
+    if (!arenas_initialized_.load(std::memory_order_acquire))
+    {
+        std::cerr << "deallocate_large called before init_arenas" << std::endl;
+        std::exit(-1);
+    }
+
+    // 根据地址查找所属的 Arena
+    int arena_idx = find_arena_index(ptr);
+    if (arena_idx < 0 || arena_idx >= num_arenas_)
+    {
+        std::cerr << "deallocate_large: ptr does not belong to any arena" << std::endl;
+        std::exit(-1);
+    }
+
+    // allocate_large 内部按 BLOCK_SIZE 对齐，拆分相同粒度归还
+    size_t aligned_bytes = align_up(static_cast<size_t>(bytes), BLOCK_SIZE);
+    size_t num_blocks = aligned_bytes / BLOCK_SIZE;
+
+    char* base = static_cast<char*>(ptr);
+    FreeBlock* head = reinterpret_cast<FreeBlock*>(base);
+    FreeBlock* tail = head;
+
+    for (size_t i = 1; i < num_blocks; ++i)
+    {
+        FreeBlock* block = reinterpret_cast<FreeBlock*>(base + i * BLOCK_SIZE);
+        tail->next = block;
+        tail = block;
+    }
+    tail->next = nullptr;
+
+    batch_deallocate_to_arena(arenas_[arena_idx], head, tail, num_blocks);
 }
 
 inline void* ConcurrentMemoryPool::allocate()
