@@ -1219,7 +1219,16 @@ private:
             if (parent->hash_map.compare_exchange_strong(expected, CONSTRUCTING,
                 std::memory_order_relaxed, std::memory_order_relaxed))
             {
-                ConcurrentMap<N>* hash_map_mem = reinterpret_cast<ConcurrentMap<N> *>(memory_pool->allocate_large(sizeof(ConcurrentMap<N>)));
+                ConcurrentMap<N>* hash_map_mem = nullptr;
+                if constexpr (sizeof(ConcurrentMap<N>) <= KMER_BLOCK_SIZE)
+                {
+                    hash_map_mem = reinterpret_cast<ConcurrentMap<N> *>(memory_pool->allocate());
+                }
+                else
+                {
+                    hash_map_mem = reinterpret_cast<ConcurrentMap<N> *>(memory_pool->allocate_large(sizeof(ConcurrentMap<N>)));
+                }
+
                 char* bucket_mem = reinterpret_cast<char*>(memory_pool->allocate_large(ConcurrentMap<N>::BUCKET_SIZE * kmer_concurrent_hash_map_capacity));
 
                 new (hash_map_mem) ConcurrentMap<N>(kmer_concurrent_hash_map_capacity, bucket_mem, memory_pool);

@@ -189,6 +189,9 @@ inline std::array<uint8_t, 1U << (2 * ROOT_BASES)> prefix_owners;
 
 inline std::array<void*, 1U << (2 * ROOT_BASES)> global_bloom_filter{};
 
+// prefix 对应的哈希表容量
+inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> concurrent_map_capacity;
+
 inline uint8_t avgQuality = 0;
 
 #endif // TREE_DEFINITION_HEADER
