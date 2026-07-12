@@ -7,7 +7,7 @@
 #include "../include/xxh3.h"
 #include "HashFunction.h"
 #include "../include/rapidhash.h"
-#include "ConcurrentMapWriter.h"
+#include "FinalDrainWriter.h"
 
 #include <array>
 #include <atomic>
@@ -20,15 +20,6 @@
 #include <vector>
 #include <utility>
 #include <mutex>
-
-template <uint32_t N>
-struct concurrent_node
-{
-    static_assert(std::is_trivially_copyable_v<kmer<N>>, "kmer<N> must be trivially copyable");
-    kmer<N> k_mer;
-    concurrent_node* next{ nullptr };
-    std::atomic<uint32_t> count{ 0 };
-};
 
 template <uint32_t N>
 struct bucket
@@ -155,7 +146,7 @@ public:
         return res;
     }
 
-    static void export_thread_node_count(ConcurrentMapWriter& writer, const int goal_thread_id)
+    static void export_thread_node_count(FinalDrainWriter<N>& writer, const int goal_thread_id)
     {
         const uint64_t full_words = k_length / BASES_PER_U64T;
         const uint64_t tail_bits = 2 * (k_length % BASES_PER_U64T);
@@ -197,10 +188,8 @@ public:
 
         if (first_block_count > 0) [[likely]]
         {
-            for (uint64_t i = 0; i < first_block_count; i++)
-            {
-                writer.write_kmer_record(&block_ptr->slots[i].k_mer.data[0], full_words, tail_bits, block_ptr->slots[i].count.load(std::memory_order_relaxed));
-            }
+            writer.write_map_record(block_ptr->slots.data(), first_block_count);
+
             remaining -= first_block_count;
         }
 
@@ -217,10 +206,8 @@ public:
                 __builtin_prefetch(block_ptr->last_blocks[SLOT_BLOCK_POINTER_NUM - 1], 0, 0);
             }
 
-            for (uint64_t i = 0; i < SLOTS_PER_BLOCK; i++)
-            {
-                writer.write_kmer_record(&block_ptr->slots[i].k_mer.data[0], full_words, tail_bits, block_ptr->slots[i].count.load(std::memory_order_relaxed));
-            }
+            writer.write_map_record(block_ptr->slots.data(), SLOTS_PER_BLOCK);
+
             remaining -= SLOTS_PER_BLOCK;
             block_ptr = block_ptr->last_blocks[0];
         }

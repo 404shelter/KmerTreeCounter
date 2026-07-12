@@ -25,7 +25,6 @@ template <uint32_t N>
 class SchedulerThreadPool final
 {
     // Worker thread constants
-    static constexpr uint32_t WORKER_QUEUE_CAPACITY = 4;
     static constexpr uint32_t INVALID_DEPTH = MAX_DEPTH;
     static constexpr uint32_t DRAIN_EMPTY_CONFIRM_ROUNDS = 8;
     static constexpr uint32_t MAX_PROCESS_TASKS = 128;
@@ -39,6 +38,7 @@ class SchedulerThreadPool final
     struct WorkerInfo
     {
         alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> depth{ INVALID_DEPTH };
+        alignas(CACHE_LINE_SIZE) std::atomic<uint32_t> local_stack_size{ 0 };
     };
 
     const uint32_t thread_count_;
@@ -50,7 +50,7 @@ class SchedulerThreadPool final
     LayerQueues<N>* layer_queues_ptr_ = nullptr;
     std::thread scheduler_thread_;
     std::vector<std::unique_ptr<std::thread>> worker_threads_ptr_;
-    std::vector<SPSCRingQueue<uint32_t, WORKER_QUEUE_CAPACITY>> worker_queues_;
+    std::vector<alignas(CACHE_LINE_SIZE) std::atomic<uint32_t>> worker_commands_;
 
     std::array<std::atomic<int>, MAX_DEPTH> depth_worker_count{};
     std::vector<WorkerInfo> worker_infos;
@@ -61,8 +61,10 @@ class SchedulerThreadPool final
 public:
     explicit SchedulerThreadPool(uint32_t thread_count, uint32_t producer_count, KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
         : thread_count_(thread_count > 1 ? thread_count : 2), active_producer(producer_count), tree_ptr_(tree_ptr),
-        layer_queues_ptr_(layer_queues_ptr), worker_queues_(thread_count - 1), worker_infos(thread_count - 1)
+        layer_queues_ptr_(layer_queues_ptr), worker_commands_(thread_count - 1), worker_infos(thread_count - 1)
     {
+        for (auto& cmd : worker_commands_)
+            cmd.store(INVALID_DEPTH, std::memory_order_relaxed);
         worker_threads_ptr_.reserve(thread_count - 1);
     }
 
@@ -172,10 +174,11 @@ private:
     // 所有 depth 切换全部由 try_switch_depth 完成
     bool try_switch_depth(const uint32_t worker_id, const uint32_t depth)
     {
+        const uint32_t max_process_task = (depth + 1 == INVALID_DEPTH) ? MAX_PROCESS_TASKS / 2 : MAX_PROCESS_TASKS;
         uint32_t processed = process_batch_at_depth(depth);
 
-        uint32_t new_depth = INVALID_DEPTH;
-        if (worker_queues_[worker_id].try_dequeue(new_depth))
+        uint32_t new_depth = worker_commands_[worker_id].exchange(INVALID_DEPTH, std::memory_order_acq_rel);
+        if (new_depth != INVALID_DEPTH)
         {
             worker_infos[worker_id].depth.store(new_depth, std::memory_order_release);
             depth_worker_count[depth].fetch_sub(1, std::memory_order_release);
@@ -227,6 +230,12 @@ private:
         {
             try_work(worker_id);
             loop_round++;
+            if ((loop_round & 0x7) == 0)
+            {
+                worker_infos[worker_id].local_stack_size.store(
+                    static_cast<uint32_t>(tree_ptr_->get_local_stack_size()),
+                    std::memory_order_release);
+            }
             if (loop_round >= FORCE_DEAL_WITH_LOCAL_STACK_ROUND)
             {
                 tree_ptr_->check_and_deal_with_local_stack();
@@ -246,12 +255,57 @@ private:
 
     void compute_ema_pressure(const std::array<uint32_t, MAX_DEPTH>& worker_snapshot)
     {
+        const uint32_t total_workers = thread_count_ - 1;
+        std::array<uint32_t, MAX_DEPTH> hidden_size{};
+        for (uint32_t w = 0; w < total_workers; ++w)
+        {
+            uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
+            if (wd < MAX_DEPTH)
+                hidden_size[wd] +=
+                worker_infos[w].local_stack_size.load(std::memory_order_acquire);
+        }
+
         for (uint32_t d = 0; d < MAX_DEPTH; ++d)
         {
             uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
-            double raw = static_cast<double>(qsize) / (worker_snapshot[d] + 1.0);
+            double raw = static_cast<double>(qsize + hidden_size[d]) / (worker_snapshot[d] + 1.0);
             double log_raw = std::log2(raw + 1.0);
             depth_ema_pressure_[d] = PRESSURE_EMA_ALPHA * log_raw + (1.0 - PRESSURE_EMA_ALPHA) * depth_ema_pressure_[d];
+        }
+    }
+
+    void update_dynamic_lower_bounds(
+        std::array<uint32_t, MAX_DEPTH>& lower_bound,
+        const uint32_t total_workers,
+        const uint32_t hard_upper_bound)
+    {
+        double total_ema = 0.0;
+        for (uint32_t d = 0; d < MAX_DEPTH; ++d)
+            total_ema += depth_ema_pressure_[d];
+
+        if (total_workers <= MAX_DEPTH)
+        {
+            lower_bound.fill(1);
+            return;
+        }
+
+        const uint32_t distributable = total_workers - MAX_DEPTH;
+        const uint32_t max_extra = std::min(
+            std::max<uint32_t>(1, total_workers / 2),
+            distributable);
+
+        if (total_ema > 0.01)
+        {
+            for (uint32_t d = 0; d < MAX_DEPTH; ++d)
+            {
+                double share = depth_ema_pressure_[d] / total_ema;
+                uint32_t dynamic_min = 1 + static_cast<uint32_t>(max_extra * share);
+                lower_bound[d] = std::min(dynamic_min, hard_upper_bound);
+            }
+        }
+        else
+        {
+            lower_bound.fill(1);
         }
     }
 
@@ -271,6 +325,9 @@ private:
 
             get_depth_worker_count_snapshot(depth_worker_count_snapshot);
             compute_ema_pressure(depth_worker_count_snapshot);
+
+            update_dynamic_lower_bounds(depth_dynamic_worker_lower_bound,
+                total_workers, hard_worker_upper_bound);
 
             // Minimum worker guarantee: ensure non-empty depths have at least 1 worker
             for (uint32_t d = 0; d < MAX_DEPTH; ++d)
@@ -292,8 +349,7 @@ private:
                             uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
                             if (wd == max_d)
                             {
-                                if (worker_queues_[w].try_enqueue(d))
-                                    break;
+                                worker_commands_[w].store(d, std::memory_order_release); break;
                             }
                         }
                     }
@@ -330,8 +386,7 @@ private:
                         uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
                         if (wd == min_d)
                         {
-                            if (worker_queues_[w].try_enqueue(max_d))
-                                break;
+                            worker_commands_[w].store(max_d, std::memory_order_release); break;
                         }
                     }
                 }
@@ -359,8 +414,7 @@ private:
                                         uint32_t wd = worker_infos[w].depth.load(std::memory_order_acquire);
                                         if (wd == d)
                                         {
-                                            if (worker_queues_[w].try_enqueue(td))
-                                                return;
+                                            worker_commands_[w].store(td, std::memory_order_release); return;
                                         }
                                     }
                                 }

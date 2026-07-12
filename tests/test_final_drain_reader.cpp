@@ -58,11 +58,11 @@ namespace
     {
         const std::string filename = set_test_temp_dir(name);
 
-        FinalDrainWriter writer;
+        FinalDrainWriter<kWords> writer(32 * kWords);
         writer.open(kRootId);
         for (const auto& record : records)
         {
-            writer.write(record);
+            writer.write_kmer_record(record.key.data.data(), record.count);
         }
         writer.close();
 
@@ -77,10 +77,10 @@ namespace
         }
 
         std::cerr << label << " mismatch at index " << index << "\n"
-                  << "  actual key:   " << std::hex << actual.key.data[0] << " "
-                  << actual.key.data[1] << std::dec << " count=" << actual.count << "\n"
-                  << "  expected key: " << std::hex << expected.key.data[0] << " "
-                  << expected.key.data[1] << std::dec << " count=" << expected.count << "\n";
+            << "  actual key:   " << std::hex << actual.key.data[0] << " "
+            << actual.key.data[1] << std::dec << " count=" << actual.count << "\n"
+            << "  expected key: " << std::hex << expected.key.data[0] << " "
+            << expected.key.data[1] << std::dec << " count=" << expected.count << "\n";
         return false;
     }
 
@@ -92,7 +92,7 @@ namespace
         if (actual.size() != expected.size())
         {
             std::cerr << label << " size mismatch: actual=" << actual.size()
-                      << " expected=" << expected.size() << "\n";
+                << " expected=" << expected.size() << "\n";
             return false;
         }
 
@@ -110,7 +110,7 @@ namespace
     {
         const std::string filename = write_root_bin({}, "tmp_final_drain_reader_empty");
 
-        FinalDrainReader<kWords> reader;
+        FinalDrainReader<kWords> reader(32 * kWords);
         reader.open(filename);
         if (!reader.finished())
         {
@@ -138,7 +138,7 @@ namespace
         const std::vector<Record> expected = make_records(3);
         const std::string filename = write_root_bin(expected, "tmp_final_drain_reader_once");
 
-        FinalDrainReader<kWords> reader;
+        FinalDrainReader<kWords> reader(2*kWords);
         reader.open(filename);
         if (reader.finished())
         {
@@ -178,10 +178,10 @@ namespace
         const std::vector<Record> expected = make_records(1024);
         const std::string filename = write_root_bin(expected, "tmp_final_drain_reader_small_batches");
 
-        FinalDrainReader<kWords> reader;
+        FinalDrainReader<kWords> reader(2 * kWords);
         reader.open(filename);
 
-        const std::vector<size_t> request_sizes{1, 3, 17, 64, 5};
+        const std::vector<size_t> request_sizes{ 1, 3, 17, 64, 5 };
         std::vector<Record> actual(expected.size());
         size_t read_pos = 0;
         size_t request_index = 0;
@@ -219,7 +219,7 @@ namespace
         const std::vector<Record> expected = make_records(record_count);
         const std::string filename = write_root_bin(expected, "tmp_final_drain_reader_cross_buffer");
 
-        FinalDrainReader<kWords> reader;
+        FinalDrainReader<kWords> reader(2 * kWords);
         reader.open(filename);
         if (reader.get_record_amount() != expected.size())
         {
@@ -227,7 +227,7 @@ namespace
             return false;
         }
 
-        const std::vector<size_t> request_sizes{1, 7, 4096, 12345, 2, 60000};
+        const std::vector<size_t> request_sizes{ 1, 7, 4096, 12345, 2, 60000 };
         std::vector<Record> actual(expected.size());
         size_t read_pos = 0;
         size_t request_index = 0;

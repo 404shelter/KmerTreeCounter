@@ -154,6 +154,15 @@ struct alignas(PAGE_SIZE) ExportBlock
     std::array<kmer<N>, EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> k_mers;
 };
 
+template <uint32_t N>
+struct concurrent_node
+{
+    static_assert(std::is_trivially_copyable_v<kmer<N>>, "kmer<N> must be trivially copyable");
+    kmer<N> k_mer;
+    concurrent_node* next{ nullptr };
+    std::atomic<uint32_t> count{ 0 };
+};
+
 // FinalDrain 导出使用的结构体
 template <uint32_t N>
 struct ExportRecord
