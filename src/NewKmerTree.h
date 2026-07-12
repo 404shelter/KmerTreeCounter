@@ -53,13 +53,19 @@ template <uint32_t N>
 class KmerTree
 {
 
+    static constexpr size_t align_up(const size_t value, const size_t alignment)
+    {
+        return (value + alignment - 1) & ~(alignment - 1);
+    }
+
     static constexpr uint64_t COUNTING_HASH_TABLE_SIZE = 256 * 1024;
     static constexpr uint64_t KMER_BUFFER_CAPACITY = KMER_BLOCK_SIZE / sizeof(kmer<N>);
 
     static constexpr int WRITER_WAITING_MAX_BACKOFF = 64;
     static constexpr int WRITER_WAITING_SPIN_TIME = 256;
 
-
+    static constexpr size_t MAP_STRIDE = align_up(sizeof(ConcurrentMap<N>), alignof(ConcurrentMap<N>));
+    static constexpr size_t MAPS_PER_BLOCK = KMER_BLOCK_SIZE / MAP_STRIDE;
 
     struct DrainFrame
     {
@@ -465,14 +471,25 @@ public:
 
         std::atomic<int> concurrent_map_index{ 0 };
 
+        std::barrier<> drain_done_barrier(worker_count);
+
         for (uint32_t i = 0; i < worker_count; ++i)
         {
 
-            workers.emplace_back([&concurrent_map_index, i, this, worker_count, tasker_worker_num]()
+            workers.emplace_back([&concurrent_map_index, &drain_done_barrier, i, this, worker_count, tasker_worker_num]()
                 {
                     FinalDrainWriter<N> writer(k_length);
                     writer.open(i);
                     ConcurrentMap<N>::set_thread_id(i + tasker_worker_num);
+
+                    auto final_drain_queue = layer_queue_->get_final_drain_queue();
+                    Task<N> task;
+                    while (final_drain_queue->try_dequeue(task))
+                    {
+                        final_drain_root(task.current_node, writer);
+                    }
+
+                    drain_done_barrier.arrive_and_wait();
 
                     ConcurrentMap<N>::export_thread_node_count(writer, i + tasker_worker_num);
 
@@ -481,13 +498,6 @@ public:
                     {
                         ConcurrentMap<N>::export_thread_node_count(writer, cur_concurrent_map_index);
                         cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
-                    }
-
-                    auto final_drain_queue = layer_queue_->get_final_drain_queue();
-                    Task<N> task;
-                    while (final_drain_queue->try_dequeue(task))
-                    {
-                        final_drain_root(task.current_node, writer);
                     }
 
                     writer.close();
