@@ -473,13 +473,6 @@ public:
                     FinalDrainWriter<N> writer(k_length);
                     writer.open(i);
                     ConcurrentMap<N>::set_thread_id(i + tasker_worker_num);
-                    auto final_drain_queue = layer_queue_->get_final_drain_queue();
-                    Task<N> task;
-                    while (final_drain_queue->try_dequeue(task))
-                    {
-                        final_drain_root(task.current_node, writer);
-                    }
-
 
                     ConcurrentMap<N>::export_thread_node_count(writer, i + tasker_worker_num);
 
@@ -488,6 +481,13 @@ public:
                     {
                         ConcurrentMap<N>::export_thread_node_count(writer, cur_concurrent_map_index);
                         cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
+                    }
+
+                    auto final_drain_queue = layer_queue_->get_final_drain_queue();
+                    Task<N> task;
+                    while (final_drain_queue->try_dequeue(task))
+                    {
+                        final_drain_root(task.current_node, writer);
                     }
 
                     writer.close();
@@ -508,7 +508,8 @@ private:
     void insert_kmer_in_task_to_node_hash_map_with_local_hash_map(const Task<N>& current_task)
     {
         node<N>* parent = current_task.current_node;
-        ConcurrentMap<N>* hash_map = ensure_hash_map(parent);
+        const uint64_t root_prefix = get_root_prefix(current_task.kmer_blocks[0]->k_mers[0]);
+        ConcurrentMap<N>* hash_map = ensure_hash_map(parent, concurrent_map_capacity[root_prefix]);
 
         uint64_t local_size_count = 0;
 
@@ -549,7 +550,8 @@ private:
     void insert_kmer_in_task_to_node_hash_map_without_local_hash_map(const Task<N>& current_task)
     {
         node<N>* parent = current_task.current_node;
-        ConcurrentMap<N>* hash_map = ensure_hash_map(parent);
+        const uint64_t root_prefix = get_root_prefix(current_task.kmer_blocks[0]->k_mers[0]);
+        ConcurrentMap<N>* hash_map = ensure_hash_map(parent, concurrent_map_capacity[root_prefix]);
 
         uint64_t local_size_count = 0;
 
@@ -951,7 +953,8 @@ private:
     void insert_kmer_in_task_to_hash_map(const Task<N>& current_task)
     {
         node<N>* parent = current_task.current_node;
-        ConcurrentMap<N>* hash_map = ensure_hash_map(parent);
+        const uint64_t root_prefix = get_root_prefix(current_task.kmer_blocks[0]->k_mers[0]);
+        ConcurrentMap<N>* hash_map = ensure_hash_map(parent, concurrent_map_capacity[root_prefix]);
 
         uint64_t local_size_count = 0;
 
@@ -1202,7 +1205,7 @@ private:
         return child_slab;
     }
 
-    ConcurrentMap<N>* ensure_hash_map(node<N>* parent)
+    ConcurrentMap<N>* ensure_hash_map(node<N>* parent, uint64_t capacity)
     {
         ConcurrentMap<N>* hash_map = parent->hash_map.load(std::memory_order_acquire);
         ConcurrentMap<N>* CONSTRUCTING = reinterpret_cast<ConcurrentMap<N> *>(MAGIC_POINTER);
@@ -1229,9 +1232,9 @@ private:
                     hash_map_mem = reinterpret_cast<ConcurrentMap<N> *>(memory_pool->allocate_large(sizeof(ConcurrentMap<N>)));
                 }
 
-                char* bucket_mem = reinterpret_cast<char*>(memory_pool->allocate_large(ConcurrentMap<N>::BUCKET_SIZE * kmer_concurrent_hash_map_capacity));
+                char* bucket_mem = reinterpret_cast<char*>(memory_pool->allocate_large(ConcurrentMap<N>::BUCKET_SIZE * capacity));
 
-                new (hash_map_mem) ConcurrentMap<N>(kmer_concurrent_hash_map_capacity, bucket_mem, memory_pool);
+                new (hash_map_mem) ConcurrentMap<N>(capacity, bucket_mem, memory_pool);
                 hash_map = hash_map_mem;
                 parent->hash_map.store(hash_map, std::memory_order_release);
             }

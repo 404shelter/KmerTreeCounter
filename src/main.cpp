@@ -49,6 +49,11 @@ void get_MAX_BLOOM_FILTER_CAPACITY()
     MAX_BLOOM_FILTER_CAPACITY = std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, corrected_memory_average_capacity);
 }
 
+uint64_t get_estimated_total_kmer(const uint64_t estimated_file_size)
+{
+    return estimated_file_size * 33 / 3 / k_len;
+}
+
 void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_num)
 {
     struct PrefixInfo
@@ -109,7 +114,12 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
     const double singleton_rate_cause_by_error = 1.0 - std::pow(1.0 - error_rate, k_len);
     const double capacity_error_factor = std::min(0.5 + singleton_rate_cause_by_error, 1.0);
 
-    const uint64_t estimated_total_kmers = estimated_file_size / 3;
+    const uint64_t estimated_total_kmers = get_estimated_total_kmer(estimated_file_size);
+
+#ifdef TEST_MODE
+    std::cout << "Estimated total k-mers: " << estimated_total_kmers << std::endl;
+#endif
+
     uint64_t total_prefix_count = 0;
 
     uint64_t max_bloom_filter_capacity = 0;
@@ -140,13 +150,79 @@ void calculate_bloom_filter_capacity(std::vector<std::atomic<uint32_t>>& prefix_
 #endif
 }
 
+void calculate_concurrent_map_capacity(
+    const std::vector<std::atomic<uint32_t>>& prefix_counts)
+{
+    const uint64_t max_cap = kmer_concurrent_hash_map_capacity;
+    const uint64_t min_cap = 1024;
+
+    std::array<uint64_t, 256> sorted;
+    for (size_t i = 0; i < prefix_counts.size(); ++i) {
+        sorted[i] = prefix_counts[i].load(std::memory_order_relaxed);
+    }
+    std::sort(sorted.begin(), sorted.end());
+
+    const uint64_t p50 = sorted[128];
+    const uint64_t p90 = sorted[230];
+
+    const double warm_low = static_cast<double>(p50);
+    const double warm_high = static_cast<double>(p90);
+    const double warm_range = warm_high - warm_low;
+
+#ifdef TEST_MODE
+    uint64_t cold_cnt = 0, warm_cnt = 0, hot_cnt = 0;
+#endif
+
+    for (size_t i = 0; i < concurrent_map_capacity.size(); ++i) {
+        const uint64_t count = prefix_counts[i].load(std::memory_order_relaxed);
+        uint64_t cap;
+
+        if (count < p50) {
+            cap = min_cap;
+#ifdef TEST_MODE
+            cold_cnt++;
+#endif
+        }
+        else if (count < p90) {
+            double t = (warm_range > 0.0)
+                ? (static_cast<double>(count) - warm_low) / warm_range
+                : 0.0;
+            cap = min_cap + static_cast<uint64_t>((max_cap - min_cap) * t);
+#ifdef TEST_MODE
+            warm_cnt++;
+#endif
+        }
+        else {
+            cap = max_cap;
+#ifdef TEST_MODE
+            hot_cnt++;
+#endif
+        }
+
+        cap = std::max(min_cap, std::bit_ceil(cap));
+        concurrent_map_capacity[i] = cap;
+    }
+
+#ifdef TEST_MODE
+    uint64_t total_mem = 0;
+    for (auto c : concurrent_map_capacity) total_mem += c * 8;
+    std::cout << "--- Hash Map Capacity Allocation ---" << std::endl;
+    std::cout << "  P50 (cold/warm): " << p50 << std::endl;
+    std::cout << "  P90 (warm/hot):  " << p90 << std::endl;
+    std::cout << "  COLD: " << cold_cnt << " -> cap=" << min_cap << std::endl;
+    std::cout << "  WARM: " << warm_cnt << " -> linear " << min_cap << "->" << max_cap << std::endl;
+    std::cout << "  HOT:  " << hot_cnt << " -> cap=" << max_cap << std::endl;
+    std::cout << "  Total bucket budget: " << total_mem / (1024 * 1024) << " MB" << std::endl;
+#endif
+}
+
 
 template<uint32_t N>
 int process_main()
 {
     const uint32_t parser_num = (n_thread / 8 > 0) ? (n_thread / 8) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
     const uint32_t worker_budget = n_thread - 2 - parser_num;
-    const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : (uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO));
+    const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : std::min<uint32_t>(12,(uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO)));
     const uint32_t tasker_num = worker_budget - classifier_num;
 
     std::cout << "Thread split:" << std::endl;
@@ -223,10 +299,11 @@ int process_main()
     get_MAX_BLOOM_FILTER_CAPACITY();
     lpt(prefix_counts, classifier_num);
     calculate_bloom_filter_capacity(prefix_counts, estimated_file_size);
+    calculate_concurrent_map_capacity(prefix_counts);
 
     // 确保 Arena 已初始化，才能安全分配内存
     pool->init_arenas();
-    //pool->perform_first_touch(n_thread);
+    // pool->perform_first_touch(n_thread);
     ConcurrentMap<N>::set_thread_num(std::max(1U, tasker_num - 1U) + n_thread);
     ConcurrentMap<N>::set_k_length(k_len);
     // 初始化 k-mer 字典树(KmerTree)的核心结构，整合前述多个组件
