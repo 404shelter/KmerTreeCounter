@@ -470,30 +470,27 @@ public:
 
             workers.emplace_back([&concurrent_map_index, i, this, worker_count, tasker_worker_num]()
                 {
-                    FinalDrainWriter writer;
+                    FinalDrainWriter<N> writer(k_length);
+                    writer.open(i);
                     ConcurrentMap<N>::set_thread_id(i + tasker_worker_num);
                     auto final_drain_queue = layer_queue_->get_final_drain_queue();
                     Task<N> task;
                     while (final_drain_queue->try_dequeue(task))
                     {
-                        uint32_t root_index = static_cast<uint32_t>(task.current_node - root_nodes);
-                        writer.open(root_index);
                         final_drain_root(task.current_node, writer);
-                        writer.close();
                     }
 
-                    ConcurrentMapWriter map_writer;
-                    map_writer.open(i);
-                    ConcurrentMap<N>::export_thread_node_count(map_writer, i + tasker_worker_num);
+
+                    ConcurrentMap<N>::export_thread_node_count(writer, i + tasker_worker_num);
 
                     int cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
                     while (cur_concurrent_map_index < tasker_worker_num)
                     {
-                        ConcurrentMap<N>::export_thread_node_count(map_writer, cur_concurrent_map_index);
+                        ConcurrentMap<N>::export_thread_node_count(writer, cur_concurrent_map_index);
                         cur_concurrent_map_index = concurrent_map_index.fetch_add(1, std::memory_order_relaxed);
                     }
 
-                    map_writer.close();
+                    writer.close();
 
                 });
         }
@@ -852,7 +849,7 @@ private:
         }
     }*/
 
-    void final_drain_root(node<N>* root_node, FinalDrainWriter& writer)
+    void final_drain_root(node<N>* root_node, FinalDrainWriter<N>& writer)
     {
         std::vector<DrainFrame> node_stack;
         std::vector<Task<N>> drain_stack;
@@ -1248,20 +1245,17 @@ private:
         return hash_map;
     }
 
-    void append_export_record(FinalDrainWriter& writer, const kmer<N>& key, const uint32_t count)
+    void append_export_record(FinalDrainWriter<N>& writer, const kmer<N>& key, const uint32_t count)
     {
         if (count < min_count || count > max_count)
         {
             return;
         }
 
-        const uint64_t full_words = k_length / BASES_PER_U64T;
-        const uint64_t tail_bits = 2 * (k_length % BASES_PER_U64T);
-
-        writer.write_kmer_record(key.data.data(), full_words, tail_bits, count);
+        writer.write_kmer_record(key.data.data(), count);
     }
 
-    void sort_and_export_leaf(node<N>* leaf, FinalDrainWriter& writer)
+    void sort_and_export_leaf(node<N>* leaf, FinalDrainWriter<N>& writer)
     {
         if (leaf->count == 0)
         {
@@ -1343,7 +1337,7 @@ private:
         leaf->active_block = nullptr;
     }
 
-    void export_hash_map(FinalDrainWriter& writer, ConcurrentMap<N>* hash_map)
+    void export_hash_map(FinalDrainWriter<N>& writer, ConcurrentMap<N>* hash_map)
     {
 
         for (uint64_t i = 0; i < kmer_concurrent_hash_map_capacity; i++)

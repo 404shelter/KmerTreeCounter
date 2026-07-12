@@ -58,11 +58,11 @@ namespace
     {
         const std::string filename = set_test_temp_dir(name);
 
-        FinalDrainWriter writer;
+        FinalDrainWriter<kWords> writer(32 * kWords);
         writer.open(kRootId);
         for (const auto& record : records)
         {
-            writer.write_kmer_record(record.key.data.data(), kWords, 0, record.count);
+            writer.write_kmer_record(record.key.data.data(), record.count);
         }
         writer.close();
 
