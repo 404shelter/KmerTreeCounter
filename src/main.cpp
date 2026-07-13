@@ -163,11 +163,11 @@ void calculate_concurrent_map_capacity(
     }
     std::sort(sorted.begin(), sorted.end());
 
-    const uint64_t p50 = sorted[128];
-    const uint64_t p90 = sorted[230];
+    const uint64_t p30 = sorted[77];
+    const uint64_t p85 = sorted[218];
 
-    const double warm_low = static_cast<double>(p50);
-    const double warm_high = static_cast<double>(p90);
+    const double warm_low = static_cast<double>(p30);
+    const double warm_high = static_cast<double>(p85);
     const double warm_range = warm_high - warm_low;
 
 #ifdef TEST_MODE
@@ -178,13 +178,13 @@ void calculate_concurrent_map_capacity(
         const uint64_t count = prefix_counts[i].load(std::memory_order_relaxed);
         uint64_t cap;
 
-        if (count < p50) {
+        if (count < p30) {
             cap = min_cap;
 #ifdef TEST_MODE
             cold_cnt++;
 #endif
         }
-        else if (count < p90) {
+        else if (count < p85) {
             double t = (warm_range > 0.0)
                 ? (static_cast<double>(count) - warm_low) / warm_range
                 : 0.0;
@@ -206,8 +206,8 @@ void calculate_concurrent_map_capacity(
 
 #ifdef TEST_MODE
     std::cout << "--- Hash Map Capacity Allocation ---" << std::endl;
-    std::cout << "  P50 (cold/warm): " << p50 << std::endl;
-    std::cout << "  P90 (warm/hot):  " << p90 << std::endl;
+    std::cout << "  P30 (cold/warm): " << p30 << std::endl;
+    std::cout << "  P85 (warm/hot):  " << p85 << std::endl;
     std::cout << "  COLD: " << cold_cnt << " -> cap=" << min_cap << std::endl;
     std::cout << "  WARM: " << warm_cnt << " -> linear " << min_cap << "->" << mid_cap << std::endl;
     std::cout << "  HOT:  " << hot_cnt << " -> cap=" << max_cap << std::endl;
