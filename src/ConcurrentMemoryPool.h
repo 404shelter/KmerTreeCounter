@@ -128,7 +128,7 @@ struct alignas(CACHE_LINE_SIZE) RemoteListHead
     RemoteListHead() : head(nullptr), count(0)
     {
         static_assert(sizeof(RemoteListHead) == CACHE_LINE_SIZE,
-                      "RemoteListHead must occupy exactly one cache line");
+            "RemoteListHead must occupy exactly one cache line");
     }
 };
 
@@ -274,13 +274,13 @@ private:
     int numa_distance_order_[MAX_NUMA_NODES][MAX_NUMA_NODES];
 
     // init_arenas 前已分配的大块偏移
-    alignas(CACHE_LINE_SIZE) std::atomic<size_t> pre_arena_offset_{0};
+    alignas(CACHE_LINE_SIZE) std::atomic<size_t> pre_arena_offset_{ 0 };
 
     // 保护 pre_arena_offset_ 的互斥锁
     std::mutex pre_arena_mutex_;
 
     // Arena 是否已初始化
-    alignas(CACHE_LINE_SIZE) std::atomic<bool> arenas_initialized_{false};
+    alignas(CACHE_LINE_SIZE) std::atomic<bool> arenas_initialized_{ false };
 
     // 线程本地缓存
     static inline thread_local ThreadLocalCache tls_cache_;
@@ -349,7 +349,7 @@ inline ThreadLocalCache::~ThreadLocalCache()
 
 inline ConcurrentMemoryPool::ConcurrentMemoryPool(size_t total_bytes)
     : num_arenas_(1), mmap_base_(nullptr), mmap_size_(0), memory_start_(nullptr), memory_size_(0),
-      page_size_(4096), total_blocks_(0), numa_available_(false), total_cpus_(1)
+    page_size_(4096), total_blocks_(0), numa_available_(false), total_cpus_(1)
 {
     // 初始化数组
     std::memset(cpus_per_node_, 0, sizeof(cpus_per_node_));
@@ -496,11 +496,11 @@ inline void ConcurrentMemoryPool::build_numa_distance_order()
             }
             // 按距离升序排序（距离相同则索引小的在前）
             std::sort(dists, dists + num_arenas_,
-                      [](const DistIndex& a, const DistIndex& b) {
-                          if (a.distance != b.distance)
-                              return a.distance < b.distance;
-                          return a.index < b.index;
-                      });
+                [](const DistIndex& a, const DistIndex& b) {
+                    if (a.distance != b.distance)
+                        return a.distance < b.distance;
+                    return a.index < b.index;
+                });
             for (int j = 0; j < num_arenas_; ++j)
             {
                 numa_distance_order_[local][j] = dists[j].index;
@@ -804,7 +804,7 @@ inline FreeBlock* ConcurrentMemoryPool::batch_allocate_from_bump(Arena& arena, s
     }
 
     char* arena_end = static_cast<char*>(arena.end_addr);
-    SpinBackoff backoff;
+    SpinBackoff<16,128,256> backoff;
 
     for (;;)
     {
@@ -945,12 +945,8 @@ inline ThreadLocalCache& ConcurrentMemoryPool::get_thread_local_cache()
 
 inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
 {
-    if (bytes == 0)
-    {
-        return nullptr;
-    }
 
-    if (!arenas_initialized_.load(std::memory_order_acquire))
+    if (!arenas_initialized_.load(std::memory_order_acquire)) [[unlikely]]
     {
         std::cerr << "allocate_large called before init_arenas" << std::endl;
         std::exit(-1);
@@ -967,7 +963,7 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
     }
 
     char* ptr = bump_allocate_from_arena(*tls.local_arena, bytes);
-    if (ptr)
+    if (ptr) [[likely]]
     {
         return ptr;
     }
@@ -992,7 +988,7 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
 
 inline void* ConcurrentMemoryPool::allocate()
 {
-    if (!arenas_initialized_.load(std::memory_order_acquire))
+    if (!arenas_initialized_.load(std::memory_order_acquire)) [[unlikely]]
     {
         std::cerr << "allocate called before init_arenas" << std::endl;
         std::exit(-1);

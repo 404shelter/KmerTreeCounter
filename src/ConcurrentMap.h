@@ -4,6 +4,7 @@
 #include "definition.h"
 #include "kmer.h"
 #include "ConcurrentMemoryPool.h"
+#include "../include/komihash.h"
 #include "../include/xxh3.h"
 #include "HashFunction.h"
 #include "../include/rapidhash.h"
@@ -63,7 +64,6 @@ class ConcurrentMap
     const uint64_t mod;
     ConcurrentMemoryPool* memory_pool = nullptr;
     bucket<N>* buckets;
-    alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> map_size{};
 
     // 新的 thread-local 状态（顺序分配 + 单槽回收）
     inline static thread_local int thread_id = -1;
@@ -100,7 +100,7 @@ public:
 
     // 按元素数量分配桶，并记录线程数
     explicit ConcurrentMap(const uint64_t in_capacity, char* bucket_memory, ConcurrentMemoryPool* in_memory_pool)
-        : capacity(in_capacity), mod(capacity - 1), memory_pool(in_memory_pool), buckets(reinterpret_cast<bucket<N>*>(bucket_memory)), map_size(0)
+        : capacity(in_capacity), mod(capacity - 1), memory_pool(in_memory_pool), buckets(reinterpret_cast<bucket<N>*>(bucket_memory))
     {
         for (uint64_t i = 0; i < capacity; ++i)
         {
@@ -140,7 +140,7 @@ public:
     // 哈希：将 k-mer 映射到桶索引
     static uint64_t hash_func(const kmer<N>& k_mer)
     {
-        const uint64_t h1 = XXH3_64bits(&k_mer, sizeof(kmer<N>));
+        const uint64_t h1 = komihash(&k_mer, sizeof(kmer<N>), 0);
         const uint64_t h2 = rapidhash(&k_mer, sizeof(kmer<N>));
         const uint64_t res = mix_hash(h1, h2);
         return res;
@@ -246,12 +246,9 @@ public:
             if (bucket.compare_exchange_strong(old_chain_first_node, new_chain_first_node,
                 std::memory_order_release, std::memory_order_acquire))
             {
-                // map_size.fetch_add(1, std::memory_order_relaxed);
                 local_size_count++;
                 return;
             }
-
-            cpu_relax(); // 短暂暂停，避免过高的缓存行刷新
 
             for (concurrent_node<N>* cur_node = old_chain_first_node; cur_node != last_find_first_node; cur_node = cur_node->next)
             {
@@ -263,6 +260,8 @@ public:
                 }
             }
             last_find_first_node = old_chain_first_node;
+
+            cpu_relax(); // 短暂暂停，避免过高的缓存行刷新
         }
     }
 
@@ -298,7 +297,6 @@ public:
             if (bucket.compare_exchange_strong(old_chain_first_node, new_chain_first_node,
                 std::memory_order_release, std::memory_order_acquire))
             {
-                map_size.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
 
@@ -312,18 +310,9 @@ public:
                 }
             }
             last_find_first_node = old_chain_first_node;
+
+            cpu_relax(); // 短暂暂停，避免过高的缓存行刷新
         }
-    }
-
-    void add_size(const uint64_t local_size_count)
-    {
-        map_size.fetch_add(local_size_count, std::memory_order_relaxed);
-    }
-
-    // 当前元素数量
-    inline uint64_t size() const
-    {
-        return map_size.load(std::memory_order_relaxed);
     }
 
     template <typename Visitor>
@@ -391,5 +380,4 @@ private:
         // 如果槽位已被占用，丢弃节点（理论上不会发生，因为 CAS 失败是串行的）
     }
 };
-
 #endif
