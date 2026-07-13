@@ -220,17 +220,6 @@ int process_main()
 {
     const uint32_t parser_num = (n_thread / 8 > 0) ? (n_thread / 8) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
     const uint32_t worker_budget = n_thread - 2 - parser_num;
-    const uint32_t fewer_worker_num = std::max(1U, worker_budget / (1.0 + TASK_CLASSIFIER_RATIO + 0.1));
-    const uint32_t more_worker_num = std::max(1U, worker_budget - fewer_worker_num);
-    const bool high_quailty = (avgQuality >= 33 + 30);
-    const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
-    const uint32_t tasker_num = high_quailty ? more_worker_num : fewer_worker_num;
-    const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
-
-    std::cout << "Thread split:" << std::endl;
-    std::cout << "  parser threads: " << parser_num << std::endl;
-    std::cout << "  classifier threads: " << classifier_num << std::endl;
-    std::cout << "  task threads: " << tasker_num << std::endl;
 
     const auto init_start = std::chrono::steady_clock::now();
 
@@ -297,6 +286,18 @@ int process_main()
 #ifdef TEST_MODE
     std::cout << "Average prefix count: " << average_count << std::endl;
 #endif
+
+    const uint32_t fewer_worker_num = std::max<uint32_t>(1U, worker_budget / (1.0 + TASK_CLASSIFIER_RATIO + 0.1));
+    const uint32_t more_worker_num = std::max<uint32_t>(1U, worker_budget - fewer_worker_num);
+    const bool high_quailty = (avgQuality >= 33 + 30);
+    const uint32_t classifier_num = high_quailty ? fewer_worker_num : more_worker_num;
+    const uint32_t tasker_num = high_quailty ? more_worker_num : fewer_worker_num;
+    const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
+
+    std::cout << "Thread split:" << std::endl;
+    std::cout << "  parser threads: " << parser_num << std::endl;
+    std::cout << "  classifier threads: " << classifier_num << std::endl;
+    std::cout << "  task threads: " << tasker_num << std::endl;
 
     get_MAX_BLOOM_FILTER_CAPACITY();
     lpt(prefix_counts, classifier_num);
