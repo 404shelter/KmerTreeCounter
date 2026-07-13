@@ -220,8 +220,9 @@ int process_main()
 {
     const uint32_t parser_num = (n_thread / 8 > 0) ? (n_thread / 8) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
     const uint32_t worker_budget = n_thread - 2 - parser_num;
-    const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : std::min<uint32_t>(12, (uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO)));
+    const uint32_t classifier_num = ((worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) - 1) == 0) ? 1 : (uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) - 1);
     const uint32_t tasker_num = worker_budget - classifier_num;
+    const uint32_t extra_drain_thread_count = n_thread - (tasker_num - 1);
 
     std::cout << "Thread split:" << std::endl;
     std::cout << "  parser threads: " << parser_num << std::endl;
@@ -313,7 +314,7 @@ int process_main()
         classifier_task_queues.push_back(std::make_shared<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>());
     }
     // 初始化并构建 Tasker 线程池，负责消费层级队列并将 k-mer 路由到深层节点 / 哈希表
-    auto task_thread_pool = std::make_shared<SchedulerThreadPool<N>>(tasker_num, classifier_num, tree.get(), layer_queues.get());
+    auto task_thread_pool = std::make_shared<SchedulerThreadPool<N>>(tasker_num, classifier_num, extra_drain_thread_count, tree.get(), layer_queues.get());
     // 初始化并且构建 Classifier 线程池，负责消费 Parser 线程产生的 k-mer 数据块，进行更精细的分类和路由
     auto classifier_thread_pool = std::make_shared<ClassifierThreadPool<N>>(k_len, tree.get(), parser_classifier_ring_pool.get(), classifier_task_queues, global_classifier_task_queue.get(), task_thread_pool.get(), pool.get(), classifier_num);
     // 初始化并构建 Parser 线程池，负责消费 FASTQ 读取器产生的数据，提取 k-mer 进行初步布隆过滤

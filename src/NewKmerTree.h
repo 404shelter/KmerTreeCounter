@@ -529,6 +529,12 @@ private:
         const uint64_t root_prefix = get_root_prefix(current_task.kmer_blocks[0]->k_mers[0]);
         ConcurrentMap<N>* hash_map = ensure_hash_map(parent, concurrent_map_capacity[root_prefix]);
 
+        if (hash_map == nullptr) [[unlikely]]
+        {
+            thread_local_task_stack.push_back(current_task);
+            return;
+        }
+
         uint64_t local_size_count = 0;
 
         /*
@@ -569,6 +575,12 @@ private:
         node<N>* parent = current_task.current_node;
         const uint64_t root_prefix = get_root_prefix(current_task.kmer_blocks[0]->k_mers[0]);
         ConcurrentMap<N>* hash_map = ensure_hash_map(parent, concurrent_map_capacity[root_prefix]);
+
+        if (hash_map == nullptr) [[unlikely]]
+        {
+            thread_local_task_stack.push_back(current_task);
+            return;
+        }
 
         uint64_t local_size_count = 0;
 
@@ -1209,7 +1221,39 @@ private:
         return hash_map_mem;
     }
 
-    ConcurrentMap<N>* ensure_hash_map(node<N>* parent, uint64_t capacity)
+    // 等待 hash map 构造完成，超时后返回 nullptr
+    [[nodiscard]] ConcurrentMap<N>* wait_for_hash_map_construction(node<N>* parent)
+    {
+        ConcurrentMap<N>* CONSTRUCTING = reinterpret_cast<ConcurrentMap<N>*>(MAGIC_POINTER);
+
+        static constexpr int BACKOFF_LIMIT = 16;
+        static constexpr int RETRY_LIMIT = 32;
+
+        int backoff_count = 1;
+        int retry_count = 0;
+
+        for (int retry_count = 0; retry_count < RETRY_LIMIT; retry_count++)
+        {
+            ConcurrentMap<N>* current = parent->hash_map.load(std::memory_order_acquire);
+            if (current != CONSTRUCTING)
+            {
+                return current;  // 构造完成，返回有效指针（正常情况）
+            }
+            else
+            {
+                // 构造中，进行自旋等待
+                for (int i = 0; i < backoff_count; i++)
+                {
+                    cpu_relax();
+                }
+                backoff_count = std::min(backoff_count * 2, BACKOFF_LIMIT);
+            }
+        }
+
+        return nullptr;  // 超时，返回 nullptr
+    }
+
+    [[nodiscard]] ConcurrentMap<N>* ensure_hash_map(node<N>* parent, uint64_t capacity)
     {
         ConcurrentMap<N>* hash_map = parent->hash_map.load(std::memory_order_acquire);
         ConcurrentMap<N>* CONSTRUCTING = reinterpret_cast<ConcurrentMap<N> *>(MAGIC_POINTER);
@@ -1245,17 +1289,13 @@ private:
             else
             {
                 // CAS 失败，说明别人正在创建，自旋等待
-                while (parent->hash_map.load(std::memory_order_relaxed) == CONSTRUCTING)
-                    cpu_relax();
-                hash_map = parent->hash_map.load(std::memory_order_acquire);
+                hash_map = wait_for_hash_map_construction(parent);
             }
         }
         else if (hash_map == CONSTRUCTING)
         {
             // 正在创建中，自旋等待
-            while (parent->hash_map.load(std::memory_order_relaxed) == CONSTRUCTING)
-                cpu_relax();
-            hash_map = parent->hash_map.load(std::memory_order_acquire);
+            hash_map = wait_for_hash_map_construction(parent);
         }
 
         return hash_map;

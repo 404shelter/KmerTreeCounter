@@ -45,7 +45,7 @@ class FastqReader
     State state_ = State::ReadHeader;
     int fd_ = -1;
     off_t file_size_ = 0;
-    std::atomic<off_t> have_read_{0};
+    std::atomic<off_t> have_read_{ 0 };
     uint64_t chunk_size_;
     std::string filename_;
     SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
@@ -108,7 +108,7 @@ public:
             std::exit(-1);
         }
 
-        if(is_gz_file)
+        if (is_gz_file)
         {
             gzfile_ = gzopen(filename.c_str(), "rb");
             if (gzfile_ == nullptr) {
@@ -153,7 +153,7 @@ public:
         {
             gzclose(gzfile_);
         }
-            if (fd_ != -1)
+        if (fd_ != -1)
         {
             ::close(fd_);
         }
@@ -173,7 +173,7 @@ public:
     void read()
     {
         // Pipeline state (only used when is_gz_file)
-        ::content_type current_input{nullptr, 0};
+        ::content_type current_input{ nullptr, 0 };
         bool have_input = false;
 
         if (is_gz_file)
@@ -198,7 +198,7 @@ public:
             {
                 pipeline_free_queue_.enqueue(current_input.data);
             }
-            
+
             file_buffer = nullptr;
         }
 
@@ -226,12 +226,12 @@ private:
             {
                 // EOF: return buffer and signal end with nullptr
                 pipeline_free_queue_.enqueue(buf);
-                pipeline_data_queue_.enqueue({nullptr, 0});
+                pipeline_data_queue_.enqueue({ nullptr, 0 });
                 break;
             }
 
             have_read_.store(gzoffset(gzfile_), std::memory_order_relaxed);
-            pipeline_data_queue_.enqueue({buf, static_cast<uint64_t>(bytes_read)});
+            pipeline_data_queue_.enqueue({ buf, static_cast<uint64_t>(bytes_read) });
         }
     }
 
@@ -314,13 +314,13 @@ private:
                         cur_percent = static_cast<double>(current_read) / static_cast<double>(file_size_);
                     }
                 }
-                
+
                 if (!eof)
                 {
                     int cur_percent_int = static_cast<int>(cur_percent * 100);
                     if (cur_percent_int - last_reported_percent >= 1 || cur_percent_int == 100)
                     {
-                        std::cout << "\rFastqReader progress: " << cur_percent_int << "%";
+                        std::cout << "\rFastqReader progress: " << cur_percent_int << "%" << std::flush;
                     }
                     if (cur_percent_int >= 100) [[unlikely]]
                     {
