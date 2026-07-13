@@ -30,7 +30,7 @@ class SchedulerThreadPool final
     static constexpr uint32_t FORCE_DEAL_WITH_LOCAL_STACK_ROUND = 32;
     // Scheduler algorithm constants
     static constexpr uint32_t SCHEDULE_INTERVAL_NS = 500;
-    static constexpr double PRESSURE_EMA_ALPHA = 0.25;
+    static constexpr double PRESSURE_EMA_ALPHA = 0.6;
     static constexpr double HYSTERESIS_LOG_DELTA = 0.585;          // log2(1.5)
     static constexpr uint32_t DRAIN_INTERVAL_NS = 250;
 
@@ -60,11 +60,11 @@ class SchedulerThreadPool final
     std::barrier<> drain_all_done_barrier;
     std::barrier<> drain_root_done_barrier_;
 
-    inline static thread_local SpinBackoff<128, 128, 256> backoff;
+    inline static thread_local SpinBackoff<128, 128, 256 * 1024> backoff;
 
 public:
     explicit SchedulerThreadPool(uint32_t thread_count, uint32_t producer_count, uint32_t extra_drain_thread_count,
-            KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
+        KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
         : thread_count_(thread_count > 1 ? thread_count : 2), extra_drain_thread_count_(extra_drain_thread_count),
         active_producer(producer_count), tree_ptr_(tree_ptr),
         layer_queues_ptr_(layer_queues_ptr), worker_commands_(thread_count_ - 1), worker_infos(thread_count_ - 1),
@@ -266,21 +266,21 @@ private:
                 {
                     uint32_t extra_id = total_workers + i;
                     extra_drain_threads_.emplace_back([this, extra_id]()
-                    {
-                        ConcurrentMap<N>::set_thread_id(extra_id);
-                        FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
-                        writer.open(extra_id);
+                        {
+                            ConcurrentMap<N>::set_thread_id(extra_id);
+                            FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
+                            writer.open(extra_id);
 
-                        auto fq = layer_queues_ptr_->get_final_drain_queue();
-                        Task<N> task;
-                        while (fq->try_dequeue(task))
-                            tree_ptr_->final_drain_root(task.current_node, writer);
+                            auto fq = layer_queues_ptr_->get_final_drain_queue();
+                            Task<N> task;
+                            while (fq->try_dequeue(task))
+                                tree_ptr_->final_drain_root(task.current_node, writer);
 
-                        drain_root_done_barrier_.arrive_and_wait();
+                            drain_root_done_barrier_.arrive_and_wait();
 
-                        ConcurrentMap<N>::export_thread_node_count(writer, extra_id);
-                        writer.close();
-                    });
+                            ConcurrentMap<N>::export_thread_node_count(writer, extra_id);
+                            writer.close();
+                        });
                 }
             }
 
