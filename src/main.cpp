@@ -155,6 +155,7 @@ void calculate_concurrent_map_capacity(
 {
     const uint64_t max_cap = kmer_concurrent_hash_map_capacity;
     const uint64_t min_cap = 1024;
+    const uint64_t mid_cap = std::max<uint64_t>(min_cap, max_cap / 2ULL);
 
     std::array<uint64_t, 256> sorted;
     for (size_t i = 0; i < prefix_counts.size(); ++i) {
@@ -187,7 +188,7 @@ void calculate_concurrent_map_capacity(
             double t = (warm_range > 0.0)
                 ? (static_cast<double>(count) - warm_low) / warm_range
                 : 0.0;
-            cap = min_cap + static_cast<uint64_t>((max_cap - min_cap) * t);
+            cap = min_cap + static_cast<uint64_t>((mid_cap - min_cap) * t);
 #ifdef TEST_MODE
             warm_cnt++;
 #endif
@@ -204,15 +205,12 @@ void calculate_concurrent_map_capacity(
     }
 
 #ifdef TEST_MODE
-    uint64_t total_mem = 0;
-    for (auto c : concurrent_map_capacity) total_mem += c * 8;
     std::cout << "--- Hash Map Capacity Allocation ---" << std::endl;
     std::cout << "  P50 (cold/warm): " << p50 << std::endl;
     std::cout << "  P90 (warm/hot):  " << p90 << std::endl;
     std::cout << "  COLD: " << cold_cnt << " -> cap=" << min_cap << std::endl;
-    std::cout << "  WARM: " << warm_cnt << " -> linear " << min_cap << "->" << max_cap << std::endl;
+    std::cout << "  WARM: " << warm_cnt << " -> linear " << min_cap << "->" << mid_cap << std::endl;
     std::cout << "  HOT:  " << hot_cnt << " -> cap=" << max_cap << std::endl;
-    std::cout << "  Total bucket budget: " << total_mem / (1024 * 1024) << " MB" << std::endl;
 #endif
 }
 
@@ -222,7 +220,7 @@ int process_main()
 {
     const uint32_t parser_num = (n_thread / 8 > 0) ? (n_thread / 8) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
     const uint32_t worker_budget = n_thread - 2 - parser_num;
-    const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : std::min<uint32_t>(12,(uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO)));
+    const uint32_t classifier_num = (worker_budget / (1.0 + TASK_CLASSIFIER_RATIO) == 0) ? 1 : std::min<uint32_t>(12, (uint32_t)(worker_budget / (1.0 + TASK_CLASSIFIER_RATIO)));
     const uint32_t tasker_num = worker_budget - classifier_num;
 
     std::cout << "Thread split:" << std::endl;
@@ -358,6 +356,14 @@ int process_main()
     const auto parser_end = std::chrono::steady_clock::now();
     classifier_thread_pool->join();
     const auto classifier_end = std::chrono::steady_clock::now();
+
+    // 标记所有的缓存已经发送完毕，向导出环形队列发送 nullptr 或退出标志
+    const auto export_join_start = std::chrono::steady_clock::now();
+    tree->mark_finish_export();
+    // 阻塞等待导出器将所有低频 k-mer 都安全写入磁盘完成
+    export_writer->join();
+    const auto export_join_end = std::chrono::steady_clock::now();
+
     // 阻塞等待 Tasker 线程消费完所有的分发任务
     task_thread_pool->join();
 
@@ -365,18 +371,10 @@ int process_main()
 
     const auto mid_end = std::chrono::steady_clock::now();
 
-    // 标记所有的缓存已经发送完毕，向导出环形队列发送 nullptr 或退出标志
-    const auto export_join_start = std::chrono::steady_clock::now();
-    tree->mark_finish_export();
-
-    // 阻塞等待导出器将所有低频 k-mer 都安全写入磁盘完成
-    export_writer->join();
-    const auto export_join_end = std::chrono::steady_clock::now();
-
     const auto final_start = std::chrono::steady_clock::now();
 
     // Final drain 阶段：多线程并行遍历整个字典树，将在节点中暂存但未下发的 k-mers 全部合并到全局哈希表中
-    tree->final_drain_parallel(n_thread, std::max(1U, tasker_num - 1U));
+    // tree->final_drain_parallel(n_thread, std::max(1U, tasker_num - 1U));
 
     std::cout << "Total read k-mer count: " << parser_thread_pool->get_total_read_kmer() << std::endl;
 
