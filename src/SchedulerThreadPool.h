@@ -56,16 +56,25 @@ class SchedulerThreadPool final
     std::vector<WorkerInfo> worker_infos;
     std::array<double, MAX_DEPTH> depth_ema_pressure_{};
 
+    std::barrier<> final_drain_done_barrier;
+    std::barrier<> drain_all_done_barrier;
+
     inline static thread_local SpinBackoff<128, 128, 256> backoff;
+
+#ifdef TEST_MODE
+    std::mutex test_mutex;
+#endif
 
 public:
     explicit SchedulerThreadPool(uint32_t thread_count, uint32_t producer_count, KmerTree<N>* tree_ptr, LayerQueues<N>* layer_queues_ptr)
         : thread_count_(thread_count > 1 ? thread_count : 2), active_producer(producer_count), tree_ptr_(tree_ptr),
-        layer_queues_ptr_(layer_queues_ptr), worker_commands_(thread_count - 1), worker_infos(thread_count - 1)
+        layer_queues_ptr_(layer_queues_ptr), worker_commands_(thread_count_ - 1), worker_infos(thread_count_ - 1),
+        final_drain_done_barrier(thread_count_ - 1),
+        drain_all_done_barrier(thread_count_ - 1)
     {
         for (auto& cmd : worker_commands_)
             cmd.store(INVALID_DEPTH, std::memory_order_relaxed);
-        worker_threads_ptr_.reserve(thread_count - 1);
+        worker_threads_ptr_.reserve(thread_count_ - 1);
     }
 
     ~SchedulerThreadPool()
@@ -122,6 +131,32 @@ private:
     bool are_all_depth_queues_empty() const
     {
         return layer_queues_ptr_->size() == 0;
+    }
+
+    void final_drain(uint32_t worker_id)
+    {
+        FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
+        writer.open(worker_id);
+
+        auto final_drain_queue = layer_queues_ptr_->get_final_drain_queue();
+        Task<N> task;
+        while (final_drain_queue->try_dequeue(task))
+        {
+            tree_ptr_->final_drain_root(task.current_node, writer);
+        }
+
+        // #ifdef TEST_MODE
+        //         {
+        //             std::lock_guard<std::mutex> lock(test_mutex);
+        //             std::cout << "Worker " << worker_id << " final drain done." << std::endl;
+        //         }
+        // #endif
+
+        final_drain_done_barrier.arrive_and_wait();
+
+        ConcurrentMap<N>::export_thread_node_count(writer, worker_id);
+
+        writer.close();
     }
 
     void drain_all(const uint32_t worker_id)
@@ -243,6 +278,9 @@ private:
             }
         }
         drain_all(worker_id);
+        drain_all_done_barrier.arrive_and_wait();
+
+        final_drain(worker_id);
     }
 
     void get_depth_worker_count_snapshot(std::array<uint32_t, MAX_DEPTH>& depth_worker_count_snapshot)

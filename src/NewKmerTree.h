@@ -100,6 +100,9 @@ class KmerTree
     static inline thread_local CountingHashMap<N> thread_local_counting_hash_map;
     // 提前分配的spare block
     static inline thread_local char* thread_local_spare_block = nullptr;
+    // 并发哈希表提前分配的spare block
+    static inline thread_local char* cur_map_block = nullptr;
+    static inline thread_local uint64_t cur_map_slot_count = 0;
 
 public:
     // 根节点数组，2^(2 * ROOT_BASES) 个，每个对应一种短前缀
@@ -133,6 +136,11 @@ public:
     inline RingMemoryPool<EXPORT_RING_MEMORY_POOL_CAPACITY>* get_export_ring_pool() const noexcept
     {
         return export_ring_pool;
+    }
+
+    inline uint32_t get_k_length() const noexcept
+    {
+        return k_length;
     }
 
     // 主线程添加函数
@@ -859,6 +867,7 @@ private:
         }
     }*/
 
+public:
     void final_drain_root(node<N>* root_node, FinalDrainWriter<N>& writer)
     {
         std::vector<DrainFrame> node_stack;
@@ -947,6 +956,7 @@ private:
         }
     }
 
+private:
     void push_kmers_into_thread_local_block_for_copy(kmer_block<N>* block_ptr, const uint32_t depth)
     {
         for (uint64_t index = 0; index < block_ptr->count; index++)
@@ -956,34 +966,6 @@ private:
             thread_local_block_for_copy[pos] = block_ptr->k_mers[index];
             thread_local_block_prefix_sums[prefix]++;
         }
-    }
-
-    void insert_kmer_in_task_to_hash_map(const Task<N>& current_task)
-    {
-        node<N>* parent = current_task.current_node;
-        const uint64_t root_prefix = get_root_prefix(current_task.kmer_blocks[0]->k_mers[0]);
-        ConcurrentMap<N>* hash_map = ensure_hash_map(parent, concurrent_map_capacity[root_prefix]);
-
-        uint64_t local_size_count = 0;
-
-        for (uint64_t block_index = 0; block_index < current_task.count; ++block_index)
-        {
-            kmer_block<N>* input_kmer_block = current_task.kmer_blocks[block_index];
-
-            for (uint64_t i = 0; i < input_kmer_block->count; ++i)
-            {
-                // if (!thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i])) [[unlikely]]
-                // {
-                //     flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
-                //     thread_local_counting_hash_map.increment(input_kmer_block->k_mers[i]);
-                // }
-                hash_map->increment(input_kmer_block->k_mers[i], local_size_count, 1);
-            }
-            memory_pool->deallocate(input_kmer_block);
-        }
-
-        // flush_local_counting_hash_map_to_hash_map(hash_map, local_size_count);
-        hash_map->add_size(local_size_count);
     }
 
     void flush_part_of_block_to_child(node<N>* child_node, const uint64_t prefix, const uint64_t in_block_for_copy_offset, const uint32_t current_depth)
@@ -1213,6 +1195,20 @@ private:
         return child_slab;
     }
 
+    [[nodiscard]] ConcurrentMap<N>* allocate_for_cur_map()
+    {
+        ConcurrentMap<N>* hash_map_mem = nullptr;
+        if (cur_map_block == nullptr || cur_map_slot_count >= MAPS_PER_BLOCK) [[unlikely]]
+        {
+            cur_map_block = reinterpret_cast<char*>(memory_pool->allocate());
+            cur_map_slot_count = 0;
+        }
+
+        hash_map_mem = reinterpret_cast<ConcurrentMap<N>*>(cur_map_block + cur_map_slot_count * MAP_STRIDE);
+        cur_map_slot_count++;
+        return hash_map_mem;
+    }
+
     ConcurrentMap<N>* ensure_hash_map(node<N>* parent, uint64_t capacity)
     {
         ConcurrentMap<N>* hash_map = parent->hash_map.load(std::memory_order_acquire);
@@ -1233,7 +1229,7 @@ private:
                 ConcurrentMap<N>* hash_map_mem = nullptr;
                 if constexpr (sizeof(ConcurrentMap<N>) <= KMER_BLOCK_SIZE)
                 {
-                    hash_map_mem = reinterpret_cast<ConcurrentMap<N> *>(memory_pool->allocate());
+                    hash_map_mem = allocate_for_cur_map();
                 }
                 else
                 {
