@@ -51,7 +51,7 @@ void get_MAX_BLOOM_FILTER_CAPACITY()
 
 uint64_t get_estimated_total_kmer(const uint64_t estimated_file_size)
 {
-    return estimated_file_size * 33 / 3 / k_len;
+    return estimated_file_size * 30 / 3 / std::max(k_len, 31U);
 }
 
 void lpt(std::vector<std::atomic<uint32_t>>& prefix_counts, uint32_t classifier_num)
