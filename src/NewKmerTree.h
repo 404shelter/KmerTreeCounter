@@ -660,7 +660,7 @@ private:
 
         if (t.depth >= MAX_DEPTH - 1) [[unlikely]]
         {
-            insert_kmer_in_task_to_node_hash_map_without_local_hash_map(t);
+            insert_kmer_in_task_to_node_hash_map_with_local_hash_map(t);
             return;
         }
 
@@ -742,7 +742,7 @@ private:
                 if (t.depth >= MAX_DEPTH - 1)
                 {
                     // Can't create children at this depth
-                    insert_kmer_in_task_to_node_hash_map_without_local_hash_map(t);
+                    insert_kmer_in_task_to_node_hash_map_with_local_hash_map(t);
                     return;
                 }
                 ensure_child_slab(current_node);
@@ -768,7 +768,7 @@ private:
         {
             std::cout << "Warning: Reached max depth but child slab already exists. Inserting into hash map." << std::endl;
             // Has existing child slab but can't descend at this depth
-            insert_kmer_in_task_to_node_hash_map_without_local_hash_map(t);
+            insert_kmer_in_task_to_node_hash_map_with_local_hash_map(t);
             return;
         }
         for (uint64_t block_index = 0; block_index < t.count; ++block_index)

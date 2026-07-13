@@ -804,7 +804,7 @@ inline FreeBlock* ConcurrentMemoryPool::batch_allocate_from_bump(Arena& arena, s
     }
 
     char* arena_end = static_cast<char*>(arena.end_addr);
-    SpinBackoff backoff;
+    SpinBackoff<16,128,256> backoff;
 
     for (;;)
     {
