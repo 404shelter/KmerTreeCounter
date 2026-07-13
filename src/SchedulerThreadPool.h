@@ -210,6 +210,16 @@ private:
             }
             else if (depth_worker_count[depth].load(std::memory_order_relaxed) > 1)
             {
+                for (uint32_t d = 0; d < MAX_DEPTH; ++d)
+                {
+                    if (d == depth) continue;
+                    uint32_t qsize = layer_queues_ptr_->get_queue(d)->size();
+                    if (qsize > MAX_PROCESS_TASKS * 2)
+                    {
+                        worker_commands_[worker_id].store(d, std::memory_order_release);
+                        return false;
+                    }
+                }
                 backoff.backoff();
             }
             else
