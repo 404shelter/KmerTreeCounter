@@ -11,7 +11,6 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <string>
 #include <vector>
 #include <fcntl.h>
 #include <unistd.h>
@@ -39,7 +38,7 @@ class FastqPreReader
     };
 
     static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
-    static constexpr uint64_t PIPELINE_QUEUE_CAPACITY = 16; // must be power of 2
+    static constexpr uint64_t PIPELINE_QUEUE_CAPACITY = 16;
 
     State state_ = State::ReadHeader;
     int fd_ = -1;
@@ -47,12 +46,13 @@ class FastqPreReader
     std::atomic<ssize_t> have_read_{0};
     ssize_t need_read_ = 0;
     uint64_t chunk_size_;
-    std::string filename_;
+    std::vector<std::string> filenames_;
+    size_t file_index_ = 0;
     SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
-    char* file_buffer;            //
-    char left_buffer_[128];       // 块在碱基行中间截断时，保存最后(k-1)个碱基用于下块前缀
-    size_t left_buffer_size_ = 0; // left_buffer_中有效碱基字节数
-    bool is_gz_file = false; // 是否为 gzip 压缩文件
+    char* file_buffer;
+    char left_buffer_[128];
+    size_t left_buffer_size_ = 0;
+    bool is_gz_file = false;
     gzFile gzfile_ = nullptr;
     uint64_t quality_sum_   = 0;
     uint64_t quality_count_ = 0;
@@ -65,165 +65,119 @@ class FastqPreReader
 public:
     int k;
 
-    explicit FastqPreReader(const std::string& filename, const int in_k, uint64_t chunk_size, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
-        : filename_(filename), ring_memory_pool_ptr_(in_ring_memory_pool_ptr),
+    explicit FastqPreReader(const std::vector<std::string>& filenames, const int in_k, uint64_t chunk_size, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
+        : filenames_(filenames), ring_memory_pool_ptr_(in_ring_memory_pool_ptr),
         k(in_k), chunk_size_(chunk_size)
     {
-        assert(ring_memory_pool_ptr_ != nullptr && "SPMCRingMemoryPool pointer must not be null");
-        assert(k > 0 && "k must be positive");
-        assert(k < 128 && "k must be < 128");
-        assert(ring_memory_pool_ptr_->blockSize() > 1024 && "block_size must be > 1024");
+        assert(ring_memory_pool_ptr_ != nullptr);
+        assert(k > 0 && k < 128);
+        assert(ring_memory_pool_ptr_->blockSize() > 1024);
+        if (filenames_.empty()) { std::cerr << "No input files" << std::endl; std::exit(-1); }
 
-        if (ring_memory_pool_ptr_ == nullptr)
+        pipeline_buffers_.resize(PIPELINE_QUEUE_CAPACITY);
+        for (uint64_t i = 0; i < PIPELINE_QUEUE_CAPACITY; ++i)
         {
-            std::cerr << "RingMemoryPool pointer is null" << std::endl;
-            std::exit(-1);
-        }
-        fd_ = ::open(filename.data(), O_RDONLY);
-        if (fd_ == -1)
-        {
-            std::cerr << "Failed to open file" << std::endl;
-            std::exit(-1);
-        }
-
-        struct stat st;
-        if (fstat(fd_, &st) == -1)
-        {
-            std::cerr << "Failed to get file size" << std::endl;
-            std::exit(-1);
-        }
-
-        file_size_ = st.st_size;
-
-        unsigned char buf[2];
-        ssize_t n = ::read(fd_, buf, 2);
-        is_gz_file = (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B);
-
-        if(is_gz_file)
-        {
-            gzfile_ = gzopen(filename.c_str(), "rb");
-            if (gzfile_ == nullptr) {
-                std::cerr << "Failed to open gzip file: " << filename << std::endl;
-                std::exit(-1);
-            }
-            if (lseek(fd_, 0, SEEK_SET) == -1) {
-                std::cerr << "Failed to seek to beginning" << std::endl;
-                std::exit(-1);
-            }
-
-            // 分配pipeline buffers，预入队到free queue
-            pipeline_buffers_.resize(PIPELINE_QUEUE_CAPACITY);
-            for (uint64_t i = 0; i < PIPELINE_QUEUE_CAPACITY; ++i)
-            {
-                pipeline_buffers_[i] = static_cast<char*>(std::aligned_alloc(4096, chunk_size_));
-                if (!pipeline_buffers_[i])
-                {
-                    std::cerr << "Failed to allocate pipeline buffer" << std::endl;
-                    std::exit(-1);
-                }
-                pipeline_free_queue_.enqueue(pipeline_buffers_[i]);
-            }
-        }
-
-        else
-        {
-            if (lseek(fd_, 0, SEEK_SET) == -1) {
-                std::cerr << "Failed to seek to beginning" << std::endl;
-                std::exit(-1);
-            }
-
-             posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM); // 随机访问提示
+            pipeline_buffers_[i] = static_cast<char*>(std::aligned_alloc(4096, chunk_size_));
+            if (!pipeline_buffers_[i]) { std::cerr << "Failed to allocate pipeline buffer" << std::endl; std::exit(-1); }
+            pipeline_free_queue_.enqueue(pipeline_buffers_[i]);
         }
 
         need_read_ = std::min((ssize_t)get_estimated_raw_fastq_file_size(), (ssize_t)256U * 1024 * 1024);
-
         file_buffer = new char[chunk_size_];
     }
 
     ~FastqPreReader()
     {
-        if (io_thread_.joinable())
-        {
-            io_thread_.join();
-        }
-        if (gzfile_ != nullptr)
-        {
-            gzclose(gzfile_);
-        }
-            if (fd_ != -1)
-        {
-            ::close(fd_);
-        }
+        if (io_thread_.joinable()) io_thread_.join();
+        if (gzfile_ != nullptr) gzclose(gzfile_);
+        if (fd_ != -1) ::close(fd_);
         delete[] file_buffer;
-        for (char* buf : pipeline_buffers_)
-        {
-            if (buf)
-            {
-                std::free(buf);
-            }
-        }
+        for (char* buf : pipeline_buffers_) if (buf) std::free(buf);
     }
 
     void pre_read()
     {
-        ::content_type current_input{nullptr, 0};
-        bool have_input = false;
-
-        if (is_gz_file)
+        for (file_index_ = 0; file_index_ < filenames_.size(); ++file_index_)
         {
-            if (file_buffer)
-            {
-                delete[] file_buffer;
-                file_buffer = nullptr;
-            }
-            // Start I/O thread
+            if (have_read_.load(std::memory_order_relaxed) >= need_read_) break;
+            open_current_file();
+
+            if (file_buffer) { delete[] file_buffer; file_buffer = nullptr; }
             io_thread_ = std::thread(&FastqPreReader::io_thread_func, this);
-        }
-        else
-        {
-            uint64_t part_size = need_read_ / 3;
-            if (part_size == 0) part_size = 1;
-            if (part_size > chunk_size_) {
-                delete[] file_buffer;
-                file_buffer = new char[part_size];
-                chunk_size_ = part_size;
-            }
-        }
 
-        parse_loop(current_input, have_input);
+            ::content_type current_input{nullptr, 0};
+            bool have_input = false;
+            parse_loop(current_input, have_input);
 
-        if (is_gz_file)
-        {
             io_thread_.join();
-            // Return remaining input buffer
             if (have_input && current_input.data != nullptr)
-            {
                 pipeline_free_queue_.enqueue(current_input.data);
-            }
-
             file_buffer = nullptr;
+
+            close_current_file();
+            state_ = State::ReadHeader;
+            left_buffer_size_ = 0;
         }
 
-        if (quality_count_ > 0)
-            avgQuality = static_cast<uint8_t>(quality_sum_ / quality_count_);
-
+        if (quality_count_ > 0) avgQuality = static_cast<uint8_t>(quality_sum_ / quality_count_);
         ring_memory_pool_ptr_->producer_set_finished();
     }
 
     uint64_t get_estimated_raw_fastq_file_size() const noexcept
     {
-        if (is_gz_file)
+        uint64_t total = 0;
+        for (const auto& f : filenames_)
         {
-            return static_cast<uint64_t>(file_size_) * 4;
+            int fd = ::open(f.data(), O_RDONLY);
+            if (fd < 0) continue;
+            struct stat st;
+            if (::fstat(fd, &st) == 0)
+            {
+                unsigned char buf[2];
+                ssize_t n = ::read(fd, buf, 2);
+                total += (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B)
+                    ? static_cast<uint64_t>(st.st_size) * 4 : static_cast<uint64_t>(st.st_size);
+            }
+            ::close(fd);
         }
-        else
-        {
-            return static_cast<uint64_t>(file_size_);
-        }
+        return (total > 0) ? total : 1;
     }
 
 private:
-    // I/O thread
+    void open_current_file()
+    {
+        const std::string& fname = filenames_[file_index_];
+        std::cout << "FastqPreReader: " << (file_index_ + 1) << "/"
+                  << filenames_.size() << ": " << fname << std::endl;
+        fd_ = ::open(fname.data(), O_RDONLY);
+        if (fd_ == -1) { std::cerr << "Failed to open" << std::endl; std::exit(-1); }
+        struct stat st;
+        if (fstat(fd_, &st) == -1) { std::cerr << "Failed to stat" << std::endl; std::exit(-1); }
+        file_size_ = st.st_size;
+
+        unsigned char buf[2];
+        ssize_t n = ::read(fd_, buf, 2);
+        is_gz_file = (n == 2 && buf[0] == 0x1F && buf[1] == 0x8B);
+        if (lseek(fd_, 0, SEEK_SET) == -1) { std::cerr << "Failed to seek" << std::endl; std::exit(-1); }
+
+        if (is_gz_file)
+        {
+            gzfile_ = gzopen(fname.c_str(), "rb");
+            if (gzfile_ == nullptr) { std::cerr << "Failed to open gzip" << std::endl; std::exit(-1); }
+        }
+        else
+        {
+            posix_fadvise(fd_, 0, 0, POSIX_FADV_RANDOM);
+        }
+    }
+
+    void close_current_file()
+    {
+        if (gzfile_ != nullptr) { gzclose(gzfile_); gzfile_ = nullptr; }
+        if (fd_ != -1) { ::close(fd_); fd_ = -1; }
+        file_size_ = 0;
+    }
+
     void io_thread_func()
     {
         while (true)
@@ -231,14 +185,13 @@ private:
             char* buf = nullptr;
             pipeline_free_queue_.dequeue(buf);
 
-            int bytes_read = gzread(gzfile_, buf, static_cast<unsigned int>(chunk_size_));
+            ssize_t bytes_read;
+            if (is_gz_file)
+                bytes_read = gzread(gzfile_, buf, static_cast<unsigned int>(chunk_size_));
+            else
+                bytes_read = ::read(fd_, buf, chunk_size_);
 
-            if (bytes_read < 0) [[unlikely]]
-            {
-                std::cerr << "Failed to read fastq data in I/O thread" << std::endl;
-                std::exit(-1);
-            }
-
+            if (bytes_read < 0) [[unlikely]] { std::cerr << "Failed to read" << std::endl; std::exit(-1); }
             if (bytes_read == 0)
             {
                 pipeline_free_queue_.enqueue(buf);
@@ -249,7 +202,6 @@ private:
             have_read_.fetch_add(static_cast<ssize_t>(bytes_read), std::memory_order_relaxed);
             pipeline_data_queue_.enqueue({buf, static_cast<uint64_t>(bytes_read)});
 
-            // 达到采样上限
             if (have_read_.load(std::memory_order_relaxed) >= need_read_)
             {
                 pipeline_data_queue_.enqueue({nullptr, 0});
@@ -260,197 +212,76 @@ private:
 
     void parse_loop(::content_type& current_input, bool& have_input)
     {
-        assert(ring_memory_pool_ptr_ != nullptr && "RingMemoryPool pointer must not be null");
+        assert(ring_memory_pool_ptr_ != nullptr);
         char* block_ptr = nullptr;
         const uint64_t block_size = ring_memory_pool_ptr_->blockSize();
-        assert(k > 0 && "k must be positive");
-        assert(k < 128 && "k must be < 128");
-        assert(block_size > 1024 && "block_size must be > 1024");
 
         const uint64_t overlap = (k > 1) ? static_cast<uint64_t>(k - 1) : 0;
-        uint64_t write_size = 0;
-        uint64_t last_newline_pos = kNoNewlineInBlock;
+        uint64_t write_size = 0, last_newline_pos = kNoNewlineInBlock;
         bool has_block = false;
-
-        uint64_t input_pos = 0;
-        uint64_t input_size = 0;
-        bool eof = false;
-        bool stop = false;
-
-        // Non-gzip segment state
-        ssize_t segment_need = need_read_ / 3;
-        if (segment_need == 0) segment_need = 1;
-        int current_segment = 0;
-        ssize_t segment_bytes_read = 0;
-
-        off_t offsets[3];
-        if (!is_gz_file)
-        {
-            offsets[0] = 0;
-            offsets[1] = (file_size_ / 2) - static_cast<off_t>(segment_need / 2);
-            if (offsets[1] < 0) offsets[1] = 0;
-            offsets[2] = file_size_ - static_cast<off_t>(segment_need);
-            if (offsets[2] < 0) offsets[2] = 0;
-        }
+        uint64_t input_pos = 0, input_size = 0;
+        bool eof = false, stop = false;
 
         while (!stop)
         {
-            if (!has_block)
-            {
-                acquire_block(block_ptr, write_size, last_newline_pos, has_block);
-            }
+            if (!has_block) acquire_block(block_ptr, write_size, last_newline_pos, has_block);
 
             if (input_pos >= input_size && !eof)
             {
-                if (is_gz_file)
+                if (have_input && current_input.data != nullptr)
                 {
-                    if (have_input && current_input.data != nullptr)
-                    {
-                        pipeline_free_queue_.enqueue(current_input.data);
-                        have_input = false;
-                    }
-                    pipeline_data_queue_.dequeue(current_input);
-
-                    if (current_input.data == nullptr)
-                    {
-                        eof = true;
-                    }
-                    else
-                    {
-                        have_input = true;
-                        file_buffer = current_input.data;
-                        input_pos = 0;
-                        input_size = current_input.length;
-                    }
+                    pipeline_free_queue_.enqueue(current_input.data);
+                    have_input = false;
                 }
-                else
-                {
-                    ssize_t bytes_read = ::read(fd_, file_buffer, chunk_size_);
-
-                    if (bytes_read < 0) [[unlikely]]
-                    {
-                        std::cerr << "Failed to read fastq data" << std::endl;
-                        std::exit(-1);
-                    }
-
-                    if (bytes_read == 0)
-                    {
-                        eof = true;
-                    }
-                    else
-                    {
-                        input_pos = 0;
-                        input_size = static_cast<uint64_t>(bytes_read);
-                        segment_bytes_read += bytes_read;
-                        have_read_.fetch_add(static_cast<ssize_t>(bytes_read), std::memory_order_relaxed);
-
-                        if (segment_bytes_read >= segment_need && current_segment < 2)
-                        {
-                            state_ = State::ReadHeader;
-                            left_buffer_size_ = 0;
-                            ++current_segment;
-                            segment_bytes_read = 0;
-                            find_next_record_start(offsets[current_segment]);
-                        }
-
-                        if (have_read_.load(std::memory_order_relaxed) >= need_read_)
-                        {
-                            eof = true;
-                        }
-                    }
-                }
+                pipeline_data_queue_.dequeue(current_input);
+                if (current_input.data == nullptr) eof = true;
+                else { have_input = true; file_buffer = current_input.data; input_pos = 0; input_size = current_input.length; }
             }
 
-            if (input_pos >= input_size)
-            {
-                if (eof)
-                {
-                    publish_current_block(block_ptr, write_size, last_newline_pos, has_block);
-                    break;
-                }
-                continue;
-            }
+            if (input_pos >= input_size) { if (eof) { publish_current_block(block_ptr, write_size, last_newline_pos, has_block); break; } continue; }
 
             const char* input_begin = file_buffer;
-
             if (state_ != State::ReadSequence)
             {
                 const char* cur = input_begin + input_pos;
                 const uint64_t remain = input_size - input_pos;
-                const void* newline_ptr = std::memchr(cur, '\n', remain);
-
-                if (newline_ptr == nullptr)
-                {
-                    input_pos = input_size;
-                    continue;
-                }
-
-                const char* newline = static_cast<const char*>(newline_ptr);
-
-                // Accumulate quality scores
+                const void* nl = std::memchr(cur, '\n', remain);
+                if (nl == nullptr) { input_pos = input_size; continue; }
+                const char* newline = static_cast<const char*>(nl);
                 if (state_ == State::ReadQuality)
                 {
-                    for (const char* p = cur; p < newline; ++p)
-                        quality_sum_ += static_cast<uint64_t>(*p);
+                    for (const char* p = cur; p < newline; ++p) quality_sum_ += static_cast<uint64_t>(*p);
                     quality_count_ += static_cast<uint64_t>(newline - cur);
                 }
-
                 input_pos = static_cast<uint64_t>(newline - input_begin) + 1;
                 state_ = advance_state_on_newline(state_);
                 continue;
             }
 
-            // HOT PATH - sequence line is copied in batches instead of char-by-char.
             const char* seq_cur = input_begin + input_pos;
             const uint64_t seq_remain = input_size - input_pos;
-            const void* newline_ptr = std::memchr(seq_cur, '\n', seq_remain);
-            const uint64_t sequence_len = (newline_ptr == nullptr)
-                ? seq_remain
-                : static_cast<uint64_t>(static_cast<const char*>(newline_ptr) - seq_cur);
+            const void* nl = std::memchr(seq_cur, '\n', seq_remain);
+            const uint64_t seq_len = (nl == nullptr) ? seq_remain
+                : static_cast<uint64_t>(static_cast<const char*>(nl) - seq_cur);
 
             uint64_t copied = 0;
-            while (copied < sequence_len)
+            while (copied < seq_len)
             {
-                if (write_size == block_size)
-                {
-                    store_overlap_from_block_end(block_ptr, write_size, last_newline_pos, overlap);
-                    publish_current_block(block_ptr, write_size, last_newline_pos, has_block);
-                    acquire_block(block_ptr, write_size, last_newline_pos, has_block);
-                }
-
-                const uint64_t block_remain = block_size - write_size;
-                const uint64_t to_copy = (sequence_len - copied < block_remain) ? (sequence_len - copied) : block_remain;
-                std::memcpy(block_ptr + write_size, seq_cur + copied, to_copy);
-                write_size += to_copy;
-                copied += to_copy;
-                input_pos += to_copy;
+                if (write_size == block_size) { store_overlap_from_block_end(block_ptr, write_size, last_newline_pos, overlap); publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block); }
+                const uint64_t rem = block_size - write_size;
+                const uint64_t tc = (seq_len - copied < rem) ? (seq_len - copied) : rem;
+                std::memcpy(block_ptr + write_size, seq_cur + copied, tc);
+                write_size += tc; copied += tc; input_pos += tc;
             }
-
-            if (stop)
-            {
-                break;
-            }
-
-            if (newline_ptr == nullptr)
-            {
-                continue;
-            }
-
-            if (write_size == block_size)
-            {
-                left_buffer_size_ = 0;
-                publish_current_block(block_ptr, write_size, last_newline_pos, has_block);
-                acquire_block(block_ptr, write_size, last_newline_pos, has_block);
-            }
-
+            if (stop) break;
+            if (nl == nullptr) continue;
+            if (write_size == block_size) { left_buffer_size_ = 0; publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block); }
             last_newline_pos = write_size;
-            block_ptr[write_size++] = '\n';
-            ++input_pos;
+            block_ptr[write_size++] = '\n'; ++input_pos;
             state_ = advance_state_on_newline(state_);
         }
     }
 
-    // 找到第一个 \n@ 的位置
     off_t find_next_record_start(off_t start_pos)
     {
         if (lseek(fd_, start_pos, SEEK_SET) == -1) return start_pos;
@@ -458,113 +289,50 @@ private:
         ssize_t n = ::read(fd_, buf, sizeof(buf));
         if (n <= 1) { lseek(fd_, start_pos, SEEK_SET); return start_pos; }
         for (ssize_t i = 1; i < n; ++i)
-        {
-            if (buf[i - 1] == '\n' && buf[i] == '@')
-            {
-                off_t aligned = start_pos + static_cast<off_t>(i);
-                lseek(fd_, aligned, SEEK_SET);
-                return aligned;
-            }
-        }
+            if (buf[i - 1] == '\n' && buf[i] == '@') { off_t a = start_pos + static_cast<off_t>(i); lseek(fd_, a, SEEK_SET); return a; }
         lseek(fd_, start_pos, SEEK_SET);
         return start_pos;
     }
 
     State advance_state_on_newline(const State current) const
     {
-        switch (current)
-        {
-        case State::ReadHeader:
-            return State::ReadSequence;
-        case State::ReadSequence:
-            return State::ReadPlus;
-        case State::ReadPlus:
-            return State::ReadQuality;
-        case State::ReadQuality:
-            return State::ReadHeader;
-        default:
-            return State::ReadHeader;
+        switch (current) {
+        case State::ReadHeader: return State::ReadSequence;
+        case State::ReadSequence: return State::ReadPlus;
+        case State::ReadPlus: return State::ReadQuality;
+        case State::ReadQuality: return State::ReadHeader;
+        default: return State::ReadHeader;
         }
     }
 
-    void acquire_block(char*& block_ptr,
-        uint64_t& write_size,
-        uint64_t& last_newline_pos,
-        bool& has_block)
+    void acquire_block(char*& block_ptr, uint64_t& write_size, uint64_t& last_newline_pos, bool& has_block)
     {
-
-        // int spin_count = 1;
-        // int backoff_iterations = 1;
-
-        // while (!ring_memory_pool_ptr_->producer_try_dequeue(block_ptr))
-        // {
-        //     spin_time++;
-        // }
         ring_memory_pool_ptr_->producer_dequeue(block_ptr);
-
-        has_block = true;
-        write_size = 0;
-        last_newline_pos = kNoNewlineInBlock;
-        assert(left_buffer_size_ <= sizeof(left_buffer_) && "left_buffer_size_ exceeds left_buffer_ capacity");
-
-        if (left_buffer_size_ > 0)
-        {
-            std::memcpy(block_ptr, left_buffer_, left_buffer_size_);
-            write_size = left_buffer_size_;
-            left_buffer_size_ = 0;
-        }
+        has_block = true; write_size = 0; last_newline_pos = kNoNewlineInBlock;
+        if (left_buffer_size_ > 0) { std::memcpy(block_ptr, left_buffer_, left_buffer_size_); write_size = left_buffer_size_; left_buffer_size_ = 0; }
     }
 
-    inline void store_overlap_from_block_end(const char* block_ptr,
-        const uint64_t write_size,
-        const uint64_t last_newline_pos,
-        const uint64_t overlap)
+    inline void store_overlap_from_block_end(const char* block_ptr, uint64_t write_size, uint64_t last_newline_pos, uint64_t overlap)
     {
         left_buffer_size_ = 0;
-        if (overlap == 0 || write_size == 0)
-        {
+        if (overlap == 0 || write_size == 0) return;
+        const uint64_t keep = (write_size < overlap) ? write_size : overlap;
+        const uint64_t start = write_size - keep;
+        if (last_newline_pos != kNoNewlineInBlock && last_newline_pos >= start) {
+            const uint64_t kp = write_size - (last_newline_pos + 1);
+            if (kp > 0) { std::memcpy(left_buffer_, block_ptr + last_newline_pos + 1, kp); left_buffer_size_ = static_cast<size_t>(kp); }
             return;
         }
-
-        const uint64_t keep_window = (write_size < overlap) ? write_size : overlap;
-        const uint64_t start = write_size - keep_window;
-
-        if (last_newline_pos != kNoNewlineInBlock && last_newline_pos >= start)
-        {
-            const uint64_t keep = write_size - (last_newline_pos + 1);
-            if (keep > 0)
-            {
-                std::memcpy(left_buffer_, block_ptr + last_newline_pos + 1, keep);
-                left_buffer_size_ = static_cast<size_t>(keep);
-            }
-            return;
-        }
-
-        std::memcpy(left_buffer_, block_ptr + start, keep_window);
-        left_buffer_size_ = static_cast<size_t>(keep_window);
+        std::memcpy(left_buffer_, block_ptr + start, keep);
+        left_buffer_size_ = static_cast<size_t>(keep);
     }
 
-    inline void publish_current_block(char*& block_ptr,
-        uint64_t& write_size,
-        uint64_t& last_newline_pos,
-        bool& has_block)
+    inline void publish_current_block(char*& block_ptr, uint64_t& write_size, uint64_t& last_newline_pos, bool& has_block)
     {
-        if (!has_block)
-        {
-            return;
-        }
-        if (write_size > 0)
-        {
-            ring_memory_pool_ptr_->producer_enqueue({ block_ptr, write_size });
-        }
-        else
-        {
-            ring_memory_pool_ptr_->consumer_enqueue(block_ptr);
-        }
-        has_block = false;
-        block_ptr = nullptr;
-        write_size = 0;
-        last_newline_pos = kNoNewlineInBlock;
+        if (!has_block) return;
+        if (write_size > 0) ring_memory_pool_ptr_->producer_enqueue({ block_ptr, write_size });
+        else ring_memory_pool_ptr_->consumer_enqueue(block_ptr);
+        has_block = false; block_ptr = nullptr; write_size = 0; last_newline_pos = kNoNewlineInBlock;
     }
 };
 
