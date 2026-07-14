@@ -68,7 +68,7 @@ public:
         : thread_count_(thread_count > 1 ? thread_count : 2), extra_drain_thread_count_(extra_drain_thread_count),
         active_producer(producer_count), tree_ptr_(tree_ptr),
         layer_queues_ptr_(layer_queues_ptr), worker_commands_(thread_count_ - 1), worker_infos(thread_count_ - 1),
-        drain_all_done_barrier(thread_count_ - 1),
+        drain_all_done_barrier(thread_count_ - 1 + extra_drain_thread_count_),
         drain_root_done_barrier_(thread_count_ - 1 + extra_drain_thread_count_)
     {
         for (auto& cmd : worker_commands_)
@@ -132,11 +132,10 @@ private:
         return layer_queues_ptr_->size() == 0;
     }
 
-    void drain_all(const uint32_t worker_id)
+    void drain_all(const uint32_t start_depth)
     {
         Task<N> task;
         uint32_t stable_empty_rounds = 0;
-        uint32_t start_depth = worker_infos[worker_id].depth.load(std::memory_order_acquire);
 
         while (stable_empty_rounds < DRAIN_EMPTY_CONFIRM_ROUNDS)
         {
@@ -263,58 +262,58 @@ private:
                 loop_round = 0;
             }
         }
-        drain_all(worker_id);
+        const uint32_t total_workers = thread_count_ - 1;
+
+        if (worker_id == 0 && extra_drain_thread_count_ > 0) [[unlikely]]
+        {
+            extra_drain_threads_.reserve(extra_drain_thread_count_);
+            for (uint32_t i = 0; i < extra_drain_thread_count_; ++i)
+            {
+                uint32_t extra_id = total_workers + i;
+                extra_drain_threads_.emplace_back([this, extra_id]()
+                    {
+                        ConcurrentMap<N>::set_thread_id(extra_id);
+                        drain_all(extra_id % MAX_DEPTH);
+                        drain_all_done_barrier.arrive_and_wait();
+                        FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
+                        writer.open(extra_id);
+
+                        auto fq = layer_queues_ptr_->get_final_drain_queue();
+                        Task<N> task;
+                        while (fq->try_dequeue(task))
+                            tree_ptr_->final_drain_root(task.current_node, writer);
+
+                        drain_root_done_barrier_.arrive_and_wait();
+
+                        ConcurrentMap<N>::export_thread_node_count(writer, extra_id);
+                        writer.close();
+                    });
+            }
+        }
+
+        drain_all(worker_infos[worker_id].depth.load(std::memory_order_acquire));
         drain_all_done_barrier.arrive_and_wait();
 
         {
-            const uint32_t total_workers = thread_count_ - 1;
+            FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
+            writer.open(worker_id);
 
-            if (worker_id == 0 && extra_drain_thread_count_ > 0) [[unlikely]]
-            {
-                extra_drain_threads_.reserve(extra_drain_thread_count_);
-                for (uint32_t i = 0; i < extra_drain_thread_count_; ++i)
-                {
-                    uint32_t extra_id = total_workers + i;
-                    extra_drain_threads_.emplace_back([this, extra_id]()
-                        {
-                            ConcurrentMap<N>::set_thread_id(extra_id);
-                            FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
-                            writer.open(extra_id);
+            auto fq = layer_queues_ptr_->get_final_drain_queue();
+            Task<N> task;
+            while (fq->try_dequeue(task))
+                tree_ptr_->final_drain_root(task.current_node, writer);
 
-                            auto fq = layer_queues_ptr_->get_final_drain_queue();
-                            Task<N> task;
-                            while (fq->try_dequeue(task))
-                                tree_ptr_->final_drain_root(task.current_node, writer);
+            drain_root_done_barrier_.arrive_and_wait();
 
-                            drain_root_done_barrier_.arrive_and_wait();
+            ConcurrentMap<N>::export_thread_node_count(writer, worker_id);
+            writer.close();
+        }
 
-                            ConcurrentMap<N>::export_thread_node_count(writer, extra_id);
-                            writer.close();
-                        });
-                }
-            }
-
-            {
-                FinalDrainWriter<N> writer(tree_ptr_->get_k_length());
-                writer.open(worker_id);
-
-                auto fq = layer_queues_ptr_->get_final_drain_queue();
-                Task<N> task;
-                while (fq->try_dequeue(task))
-                    tree_ptr_->final_drain_root(task.current_node, writer);
-
-                drain_root_done_barrier_.arrive_and_wait();
-
-                ConcurrentMap<N>::export_thread_node_count(writer, worker_id);
-                writer.close();
-            }
-
-            if (worker_id == 0 && extra_drain_thread_count_ > 0) [[unlikely]]
-            {
-                for (auto& t : extra_drain_threads_)
-                    if (t.joinable()) t.join();
-                extra_drain_threads_.clear();
-            }
+        if (worker_id == 0 && extra_drain_thread_count_ > 0) [[unlikely]]
+        {
+            for (auto& t : extra_drain_threads_)
+                if (t.joinable()) t.join();
+            extra_drain_threads_.clear();
         }
     }
 
