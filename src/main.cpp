@@ -28,13 +28,14 @@
 #include <bitset>
 #include <atomic>
 #include <algorithm>
+#include <dirent.h>
 #include <cmath>
 
 uint32_t k_len;        // k-mer 的长度 (例如: 31, 41)
 uint32_t n_thread;     // 允许使用的总线程数
 uint64_t memory_limit; // 全局最大内存限制，单位为 GB
 uint64_t estimated_file_size;    // 输入 FASTQ 文件的估计大小，单位为字节
-std::string filename;
+std::vector<std::string> filenames;
 
 void get_MAX_BLOOM_FILTER_CAPACITY()
 {
@@ -237,7 +238,7 @@ int process_main()
     auto global_classifier_task_queue = std::make_shared<MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>>();
 
     // PreRead阶段
-    FastqPreReader<N> pre_reader(filename, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
+    FastqPreReader<N> pre_reader(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
     estimated_file_size = pre_reader.get_estimated_raw_fastq_file_size();
     auto pre_parser_thread = std::thread([&]
         {
@@ -333,7 +334,7 @@ int process_main()
     layer_queues->initialize_final_drain_queue(prefix_counts, tree->root_nodes);
 
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
-    FastqReader<N> reader(filename, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
+    FastqReader<N> reader(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
     // FastqClassifier<N> classifier(k_len, parser_classifier_ring_pool.get(), tree.get());
 
     const auto init_end = std::chrono::steady_clock::now();
@@ -459,7 +460,40 @@ int main(int argc, char* argv[])
 
     try
     {
-        filename = argv[1];
+        {
+            std::string arg = argv[1];
+            struct stat st;
+            if (::stat(arg.c_str(), &st) == 0 && S_ISDIR(st.st_mode))
+            {
+                //文件夹
+                DIR* dir = ::opendir(arg.c_str());
+                if (dir == nullptr)
+                {
+                    std::cerr << "Failed to open directory: " << arg << std::endl;
+                    std::exit(-1);
+                }
+                struct dirent* entry;
+                while ((entry = ::readdir(dir)) != nullptr)
+                {
+                    if (entry->d_name[0] == '.') continue; 
+                    filenames.push_back(arg + "/" + entry->d_name);
+                }
+                ::closedir(dir);
+                std::sort(filenames.begin(), filenames.end());
+            }
+            else
+            {
+                // 逗号分隔的文件列表或单个文件
+                size_t pos = 0;
+                while ((pos = arg.find(',')) != std::string::npos)
+                {
+                    filenames.push_back(arg.substr(0, pos));
+                    arg.erase(0, pos + 1);
+                }
+                if (!arg.empty())
+                    filenames.push_back(arg);
+            }
+        }
         k_len = std::stoul(argv[2]);
         n_thread = std::stoul(argv[3]);
         memory_limit = std::stoull(argv[4]);
@@ -484,7 +518,9 @@ int main(int argc, char* argv[])
         }
 
         std::cout << "Input parameters:" << std::endl;
-        std::cout << "  Fastq file: " << filename << std::endl;
+        std::cout << "  Fastq files (" << filenames.size() << "):" << std::endl;
+        for (const auto& f : filenames)
+            std::cout << "    " << f << std::endl;
         std::cout << "  k-mer length: " << k_len << std::endl;
         std::cout << "  Thread count: " << n_thread << std::endl;
         std::cout << "  Memory limit (GB): " << memory_limit << std::endl;
