@@ -336,4 +336,251 @@ private:
     }
 };
 
+template <uint32_t N>
+class ReaderThreadPool
+{
+    using content_type = std::pair<char*, uint64_t>;
+
+    enum class State
+    {
+        ReadHeader,
+        ReadSequence,
+        ReadPlus,
+        ReadQuality
+    };
+
+    static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
+    static constexpr uint64_t GZ_CHUNK_MULTIPLIER = 8;
+
+    int k_;
+    uint64_t base_chunk_size_;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_pool_ptr_;
+
+    std::vector<std::string> gz_files_;
+    std::vector<std::string> plain_files_;
+    uint32_t reader_count_;
+    std::vector<std::unique_ptr<std::thread>> threads_;
+
+public:
+    explicit ReaderThreadPool(
+        const std::vector<std::string>& filenames,
+        int in_k,
+        uint64_t chunk_size,
+        RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* pool_ptr)
+        : k_(in_k), base_chunk_size_(chunk_size), ring_pool_ptr_(pool_ptr)
+    {
+        assert(ring_pool_ptr_ != nullptr);
+        assert(k_ > 0 && k_ < 128);
+        assert(ring_pool_ptr_->blockSize() > 1024);
+        if (filenames.empty()) { std::cerr << "No input files" << std::endl; std::exit(-1); }
+
+        classify_files(filenames);
+
+        reader_count_ = (gz_files_.size() >= 2) ? 2 : 1;
+        threads_.reserve(reader_count_);
+    }
+
+    void start()
+    {
+        std::vector<std::vector<std::string>> assignments(reader_count_);
+        for (size_t i = 0; i < gz_files_.size(); ++i)
+            assignments[i % reader_count_].push_back(gz_files_[i]);
+        for (size_t i = 0; i < plain_files_.size(); ++i)
+            assignments[i % reader_count_].push_back(plain_files_[i]);
+
+        for (uint32_t i = 0; i < reader_count_; ++i)
+        {
+            threads_.push_back(std::make_unique<std::thread>([this, assigned = std::move(assignments[i])]() {
+                reader_worker(assigned);
+            }));
+        }
+    }
+
+    void join()
+    {
+        for (auto& t : threads_)
+        {
+            if (t->joinable()) t->join();
+        }
+    }
+
+private:
+    void classify_files(const std::vector<std::string>& filenames)
+    {
+        for (const auto& f : filenames)
+        {
+            if (f.size() >= 3 && f.compare(f.size() - 3, 3, ".gz") == 0)
+                gz_files_.push_back(f);
+            else
+                plain_files_.push_back(f);
+        }
+    }
+
+    static State advance_state(const State current)
+    {
+        switch (current) {
+        case State::ReadHeader: return State::ReadSequence;
+        case State::ReadSequence: return State::ReadPlus;
+        case State::ReadPlus: return State::ReadQuality;
+        case State::ReadQuality: return State::ReadHeader;
+        default: return State::ReadHeader;
+        }
+    }
+
+    inline void acquire_block(char*& block_ptr, uint64_t& write_size, uint64_t& last_newline_pos,
+                               bool& has_block, size_t& left_buffer_size_, char* left_buffer_)
+    {
+        ring_pool_ptr_->producer_dequeue(block_ptr);
+        has_block = true; write_size = 0; last_newline_pos = kNoNewlineInBlock;
+        if (left_buffer_size_ > 0) { std::memcpy(block_ptr, left_buffer_, left_buffer_size_); write_size = left_buffer_size_; left_buffer_size_ = 0; }
+    }
+
+    inline void publish_current_block(char*& block_ptr, uint64_t& write_size,
+                                       uint64_t& last_newline_pos, bool& has_block)
+    {
+        if (!has_block) return;
+        if (write_size > 0) ring_pool_ptr_->producer_enqueue({ block_ptr, write_size });
+        else ring_pool_ptr_->consumer_enqueue(block_ptr);
+        has_block = false; block_ptr = nullptr; write_size = 0; last_newline_pos = kNoNewlineInBlock;
+    }
+
+    inline void store_overlap_from_block_end(const char* block_ptr, uint64_t write_size,
+                                              uint64_t last_newline_pos, uint64_t overlap,
+                                              size_t& left_buffer_size_, char* left_buffer_)
+    {
+        left_buffer_size_ = 0;
+        if (overlap == 0 || write_size == 0) return;
+        const uint64_t keep = (write_size < overlap) ? write_size : overlap;
+        const uint64_t start = write_size - keep;
+        if (last_newline_pos != kNoNewlineInBlock && last_newline_pos >= start) {
+            const uint64_t kp = write_size - (last_newline_pos + 1);
+            if (kp > 0) { std::memcpy(left_buffer_, block_ptr + last_newline_pos + 1, kp); left_buffer_size_ = static_cast<size_t>(kp); }
+            return;
+        }
+        std::memcpy(left_buffer_, block_ptr + start, keep);
+        left_buffer_size_ = static_cast<size_t>(keep);
+    }
+
+    void reader_worker(const std::vector<std::string>& assigned_files)
+    {
+        assert(ring_pool_ptr_ != nullptr);
+        const uint64_t block_size = ring_pool_ptr_->blockSize();
+
+        State state_;
+        char left_buffer_[128];
+        size_t left_buffer_size_ = 0;
+        const uint64_t overlap = (k_ > 1) ? static_cast<uint64_t>(k_ - 1) : 0;
+
+        for (const auto& file : assigned_files)
+        {
+            const bool is_gz = (file.size() >= 3 && file.compare(file.size() - 3, 3, ".gz") == 0);
+            const uint64_t effective_chunk_size = is_gz ? base_chunk_size_ * GZ_CHUNK_MULTIPLIER : base_chunk_size_;
+
+            int fd = -1;
+            gzFile gzfile = nullptr;
+
+            fd = ::open(file.c_str(), O_RDONLY);
+            if (fd == -1) { std::cerr << "Failed to open: " << file << std::endl; std::exit(-1); }
+
+            if (is_gz)
+            {
+                gzfile = gzopen(file.c_str(), "rb");
+                if (gzfile == nullptr) { std::cerr << "Failed to open gzip: " << file << std::endl; std::exit(-1); }
+            }
+            else
+            {
+                posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+            }
+
+            std::vector<char> read_buf(effective_chunk_size);
+
+            state_ = State::ReadHeader;
+            left_buffer_size_ = 0;
+            char* block_ptr = nullptr;
+            uint64_t write_size = 0;
+            bool has_block = false;
+            uint64_t last_newline_pos = kNoNewlineInBlock;
+
+            uint64_t input_pos = 0, input_size = 0;
+            bool eof = false;
+
+            while (true)
+            {
+                if (input_pos >= input_size && !eof)
+                {
+                    ssize_t bytes_read;
+                    if (is_gz)
+                        bytes_read = gzread(gzfile, read_buf.data(), static_cast<unsigned int>(effective_chunk_size));
+                    else
+                        bytes_read = ::read(fd, read_buf.data(), effective_chunk_size);
+
+                    if (bytes_read < 0) [[unlikely]]
+                    {
+                        std::cerr << "Failed to read fastq data: " << file << std::endl;
+                        std::exit(-1);
+                    }
+                    if (bytes_read <= 0)
+                    {
+                        eof = true;
+                    }
+                    else
+                    {
+                        input_pos = 0;
+                        input_size = static_cast<uint64_t>(bytes_read);
+                    }
+                }
+
+                if (!has_block)
+                    acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_);
+
+                if (input_pos >= input_size)
+                {
+                    if (eof) { publish_current_block(block_ptr, write_size, last_newline_pos, has_block); break; }
+                    continue;
+                }
+
+                const char* input_begin = read_buf.data();
+                if (state_ != State::ReadSequence)
+                {
+                    const char* cur = input_begin + input_pos;
+                    const uint64_t remain = input_size - input_pos;
+                    const void* nl = std::memchr(cur, '\n', remain);
+                    if (nl == nullptr) { input_pos = input_size; continue; }
+                    input_pos = static_cast<uint64_t>(static_cast<const char*>(nl) - input_begin) + 1;
+                    state_ = advance_state(state_);
+                    continue;
+                }
+
+                const char* seq_cur = input_begin + input_pos;
+                const uint64_t seq_remain = input_size - input_pos;
+                const void* nl = std::memchr(seq_cur, '\n', seq_remain);
+                const uint64_t seq_len = (nl == nullptr) ? seq_remain
+                    : static_cast<uint64_t>(static_cast<const char*>(nl) - seq_cur);
+
+                uint64_t copied = 0;
+                while (copied < seq_len)
+                {
+                    if (write_size == block_size) { store_overlap_from_block_end(block_ptr, write_size, last_newline_pos, overlap, left_buffer_size_, left_buffer_); publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_); }
+                    const uint64_t rem = block_size - write_size;
+                    const uint64_t tc = (seq_len - copied < rem) ? (seq_len - copied) : rem;
+                    std::memcpy(block_ptr + write_size, seq_cur + copied, tc);
+                    write_size += tc; copied += tc; input_pos += tc;
+                }
+                if (nl == nullptr) continue;
+                if (write_size == block_size) { left_buffer_size_ = 0; publish_current_block(block_ptr, write_size, last_newline_pos, has_block); acquire_block(block_ptr, write_size, last_newline_pos, has_block, left_buffer_size_, left_buffer_); }
+                last_newline_pos = write_size;
+                block_ptr[write_size++] = '\n'; ++input_pos;
+                state_ = advance_state(state_);
+            }
+
+            if (is_gz) gzclose(gzfile);
+            else ::close(fd);
+
+            std::cout << "FastqReader: completed " << file << std::endl;
+        }
+
+        ring_pool_ptr_->producer_set_finished();
+    }
+};
+
 #endif

@@ -219,15 +219,22 @@ void calculate_concurrent_map_capacity(
 template<uint32_t N>
 int process_main()
 {
-    const uint32_t parser_num = (n_thread / 8 > 0) ? (n_thread / 8) : 1; // 预留至少 1 个线程给 Parser，剩余线程在 Parser 和 Tasker 之间分配
-    const uint32_t worker_budget = n_thread - 2 - parser_num;
+    uint32_t gz_count = 0;
+    for (const auto& f : filenames) {
+        if (f.size() >= 3 && f.compare(f.size() - 3, 3, ".gz") == 0) gz_count++;
+    }
+    const uint32_t reader_num = (gz_count >= 2) ? 2 : 1;
+
+    const uint32_t remaining = n_thread - reader_num - 1;  // -1: export writer
+    const uint32_t parser_num = std::max(1U, remaining / 8);
+    const uint32_t worker_budget = remaining - parser_num;
 
     const auto init_start = std::chrono::steady_clock::now();
 
     // 初始化层级队列，用于在树的不同深度间传递任务
     auto layer_queues = std::make_shared<LayerQueues<N>>();
     // 初始化解析器环形内存池，管理 Reader 读取后的碱基字符串数据块
-    auto reader_parser_ring_pool = std::make_shared<SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, 1);
+    auto reader_parser_ring_pool = std::make_shared<RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>>(READER_PARSER_RING_MEMORY_POOL_BLOCK_SIZE, 1);
     // 初始化分类器环形内存池，管理 Parser 线程处理后的 k-mer 数据块
     auto parser_classifier_ring_pool = std::make_shared<RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>>(PARSER_CLASSIFIER_RING_MEMORY_POOL_BLOCK_SIZE, 1);
     // 初始化导出用的环形内存池，管理低频 k-mer 的导出数据块
@@ -328,34 +335,32 @@ int process_main()
     auto export_writer = std::make_shared<ExportWriter<N>>(k_len, export_ring_pool.get());
 
     // 正式计数阶段
-    reader_parser_ring_pool->reset_producers(1); // Reader 线程是单生产者
+    reader_parser_ring_pool->reset_producers(reader_num);
     parser_classifier_ring_pool->reset_producers(parser_num);
     // 初始化最终排干(drain)阶段所需的初始任务
     layer_queues->initialize_final_drain_queue(prefix_counts, tree->root_nodes);
 
     // 初始化 FASTQ 读取器，将大文件分块读取并送入 ring_pool 用作流水线起点
-    FastqReader<N> reader(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
+    ReaderThreadPool<N> reader_pool(filenames, k_len, FASTQ_FILE_CHUNK_SIZE, reader_parser_ring_pool.get());
     // FastqClassifier<N> classifier(k_len, parser_classifier_ring_pool.get(), tree.get());
 
     const auto init_end = std::chrono::steady_clock::now();
 
     const auto mid_start = std::chrono::steady_clock::now();
 
-    // 启动多线程流水线的各个工作线程
+    const auto read_start = std::chrono::steady_clock::now();
+
+    reader_pool.start();
     parser_thread_pool->start();
     classifier_thread_pool->start();
     task_thread_pool->start();
     export_writer->start();
 
-    const auto read_start = std::chrono::steady_clock::now();
-
-    // 在主线程中运行读取器，读取文件块并推送给 Parser
-    reader.read();
-
-    const auto read_end = std::chrono::steady_clock::now();
-
     // classifier.classify_and_push();
     // task_thread_pool->mark_producer_done(); // 显式标记 Classifier 的生产者角色完成，通知 Scheduler 不再有新数据
+
+    reader_pool.join();
+    const auto read_end = std::chrono::steady_clock::now();
 
     // 阻塞等待 Parser 线程将所有文件块解析并生成 k-mer 完成
     parser_thread_pool->join();
@@ -448,10 +453,10 @@ int process_main()
 int main(int argc, char* argv[])
 {
 
-    if (argc < 5 || argc > 8)
+    if (argc < 6 || argc > 9)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> [map_capacity] [min_count] [max_count]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [min_count] [max_count]" << std::endl;
         return 1;
     }
 
@@ -497,18 +502,21 @@ int main(int argc, char* argv[])
         k_len = std::stoul(argv[2]);
         n_thread = std::stoul(argv[3]);
         memory_limit = std::stoull(argv[4]);
+        temp_dir = argv[5];
+        if (!temp_dir.empty() && temp_dir.back() != '/')
+            temp_dir += '/';
 
-        if (argc >= 6)
-        {
-            kmer_concurrent_hash_map_capacity = std::max<uint32_t>(KMER_BATCH_SIZE / sizeof(std::atomic<void*>), std::bit_ceil(std::stoul(argv[5])));
-        }
         if (argc >= 7)
         {
-            min_count = std::stoul(argv[6]);
+            kmer_concurrent_hash_map_capacity = std::max<uint32_t>(1024, std::bit_ceil(std::stoul(argv[6])));
         }
         if (argc >= 8)
         {
-            max_count = std::stoul(argv[7]);
+            min_count = std::stoul(argv[7]);
+        }
+        if (argc >= 9)
+        {
+            max_count = std::stoul(argv[8]);
         }
 
         if (n_thread < 6)
@@ -531,14 +539,14 @@ int main(int argc, char* argv[])
     catch (const std::exception&)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> [map_capacity] [min_count] [max_count]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [min_count] [max_count]" << std::endl;
         return 1;
     }
 
     if (kmer_concurrent_hash_map_capacity <= 1 || kmer_concurrent_hash_map_capacity >= 16ULL * 1024 * 1024 || max_count < min_count)
     {
         std::cerr << "Usage: " << argv[0]
-            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> [map_capacity] [min_count] [max_count]" << std::endl;
+            << " <fastq_file> <k_len> <n_thread> <memory_limit_gb> <temp_dir> [map_capacity] [min_count] [max_count]" << std::endl;
         return 1;
     }
 
