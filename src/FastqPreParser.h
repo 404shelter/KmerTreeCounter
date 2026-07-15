@@ -26,7 +26,7 @@ class FastqPreParser
     int k_len;
 
     uint64_t total_read_kmer = 0;
-    SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* reader_parser_ring_pool;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* reader_parser_ring_pool;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
 
     std::array<uint32_t, 1ULL << (2 * ROOT_BASES)> local_block_prefix_counts{};
@@ -51,7 +51,7 @@ public:
     bool not_first_flag = false;
 #endif
 
-    explicit FastqPreParser(uint32_t in_k_len, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_reader_parser_ring_pool,
+    explicit FastqPreParser(uint32_t in_k_len, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_reader_parser_ring_pool,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool)
         : k_len(in_k_len), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), get_kmer(in_k_len)
     {

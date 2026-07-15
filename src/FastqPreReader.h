@@ -48,7 +48,7 @@ class FastqPreReader
     uint64_t chunk_size_;
     std::vector<std::string> filenames_;
     size_t file_index_ = 0;
-    SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* ring_memory_pool_ptr_;
     char* file_buffer;
     char left_buffer_[128];
     size_t left_buffer_size_ = 0;
@@ -65,7 +65,7 @@ class FastqPreReader
 public:
     int k;
 
-    explicit FastqPreReader(const std::vector<std::string>& filenames, const int in_k, uint64_t chunk_size, SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
+    explicit FastqPreReader(const std::vector<std::string>& filenames, const int in_k, uint64_t chunk_size, RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_ring_memory_pool_ptr)
         : filenames_(filenames), ring_memory_pool_ptr_(in_ring_memory_pool_ptr),
         k(in_k), chunk_size_(chunk_size)
     {
