@@ -23,11 +23,18 @@ file(GLOB_RECURSE SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
 )
 
-find_package(ZLIB REQUIRED)
+set(BUILD_SHARED_LIBS OFF)
+
+set(ZLIB_COMPAT ON)
+
+set(ZLIB_ENABLE_TESTS OFF)
+set(ZLIB_ENABLE_EXAMPLES OFF)
+
+add_subdirectory(third_party/zlib-ng)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
-target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
+target_link_libraries(${PROJECT_NAME} zlib)
 target_link_libraries(${PROJECT_NAME} rt)
 target_link_libraries(${PROJECT_NAME} pthread)
 
