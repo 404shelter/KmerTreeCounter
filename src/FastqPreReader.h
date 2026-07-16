@@ -82,7 +82,7 @@ public:
             pipeline_free_queue_.enqueue(pipeline_buffers_[i]);
         }
 
-        need_read_ = std::min((ssize_t)get_estimated_raw_fastq_file_size(), (ssize_t)256U * 1024 * 1024);
+        // need_read_ 在 pre_read() 中按文件数动态设置
         file_buffer = new char[chunk_size_];
     }
 
@@ -97,10 +97,14 @@ public:
 
     void pre_read()
     {
+        const ssize_t per_file_limit = (filenames_.size() == 1)
+            ? static_cast<ssize_t>(256U * 1024 * 1024)
+            : static_cast<ssize_t>(128U * 1024 * 1024);
+
         for (file_index_ = 0; file_index_ < filenames_.size(); ++file_index_)
         {
-            if (have_read_.load(std::memory_order_relaxed) >= need_read_) break;
             open_current_file();
+            need_read_ = std::min(file_size_, per_file_limit);
 
             if (file_buffer) { delete[] file_buffer; file_buffer = nullptr; }
             io_thread_ = std::thread(&FastqPreReader::io_thread_func, this);
