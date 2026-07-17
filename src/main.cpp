@@ -463,6 +463,10 @@ int main(int argc, char* argv[])
     min_count = 1;
     max_count = std::numeric_limits<uint32_t>::max();
 
+#ifdef ZLIBNG_VERSION
+    std::cout << "Using zlib-ng version " << ZLIBNG_VERSION << std::endl;
+#endif
+
     try
     {
         {
@@ -480,7 +484,7 @@ int main(int argc, char* argv[])
                 struct dirent* entry;
                 while ((entry = ::readdir(dir)) != nullptr)
                 {
-                    if (entry->d_name[0] == '.') continue; 
+                    if (entry->d_name[0] == '.') continue;
                     filenames.push_back(arg + "/" + entry->d_name);
                 }
                 ::closedir(dir);
@@ -568,6 +572,6 @@ int main(int argc, char* argv[])
     else
     {
         std::cerr << "k_len must be <= 128" << std::endl;
-        return 1;
+        return 1; 
     }
 }
