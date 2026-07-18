@@ -619,6 +619,12 @@ private:
             return;
         }
 
+        if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+        {
+            enqueue_to_classifier_backoff.decay();
+            return;
+        }
+
         enqueue_to_classifier_backoff.backoff();
 
         while (true)
@@ -632,7 +638,6 @@ private:
             {
                 break;
             }
-            enqueue_to_classifier_backoff.backoff();
             if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
             {
                 break;

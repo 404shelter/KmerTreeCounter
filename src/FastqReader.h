@@ -350,7 +350,7 @@ class ReaderThreadPool
     };
 
     static constexpr uint64_t kNoNewlineInBlock = static_cast<uint64_t>(-1);
-    static constexpr uint64_t GZ_CHUNK_MULTIPLIER = 2;
+    static constexpr uint64_t GZ_CHUNK_MULTIPLIER = 1;
 
     int k_;
     uint64_t base_chunk_size_;

@@ -165,7 +165,7 @@ public:
                     else
                     {
                         // 自旋等待
-                        enqueue_backoff.decay();
+                        enqueue_backoff.backoff();
 
                         while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
                         {
