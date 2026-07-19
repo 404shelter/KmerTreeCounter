@@ -1303,7 +1303,7 @@ private:
 
     void append_export_record(FinalDrainWriter<N>& writer, const kmer<N>& key, const uint32_t count)
     {
-        if (count < min_count || count > max_count)
+        if (count + 1 < min_count || count > max_count)
         {
             return;
         }

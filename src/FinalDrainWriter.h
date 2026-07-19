@@ -46,7 +46,7 @@ public:
     {
         if (current_block_ != nullptr)
         {
-            pool_->producer_enqueue({current_block_, current_offset_});
+            pool_->producer_enqueue({ current_block_, current_offset_ });
             current_block_ = nullptr;
         }
         sorted_kmer_count.fetch_add(local_sorted_kmer_count, std::memory_order_relaxed);
@@ -85,7 +85,9 @@ public:
             (FINAL_DRAIN_RING_POOL_BLOCK_SIZE - current_offset_) / total_bytes);
         for (uint32_t i = 0; i < first_to_write; i++)
         {
-            const auto& node = nodes[i];
+            const uint32_t rec_count = node.count.load(std::memory_order_relaxed);
+            if (rec_count + 1 < min_count || rec_count > max_count) [[unlikely]]
+                continue;
             std::memcpy(current_block_ + current_offset_, node.k_mer.data.data(),
                 full_words * sizeof(uint64_t));
             current_offset_ += full_words * sizeof(uint64_t);
@@ -126,7 +128,7 @@ public:
 private:
     void flush_block()
     {
-        pool_->producer_enqueue({current_block_, current_offset_});
+        pool_->producer_enqueue({ current_block_, current_offset_ });
         pool_->producer_dequeue(current_block_);
         current_offset_ = 0;
     }
