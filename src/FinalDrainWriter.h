@@ -87,8 +87,12 @@ public:
         {
             const auto& node = nodes[i];
             const uint32_t rec_count = node.count.load(std::memory_order_relaxed);
+
             if (rec_count + 1 < min_count || rec_count > max_count) [[unlikely]]
+            {
                 continue;
+            }
+            
             std::memcpy(current_block_ + current_offset_, node.k_mer.data.data(),
                 full_words * sizeof(uint64_t));
             current_offset_ += full_words * sizeof(uint64_t);
