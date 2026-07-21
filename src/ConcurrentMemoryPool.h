@@ -3,6 +3,8 @@
 
 // 并发内存池 - NUMA感知设计
 // 固定块模型（4KB），线程本地缓存，跨线程释放支持
+// 磁盘溢出（spill）：匿名内存耗尽后，懒创建文件映射（MAP_SHARED）作为全局溢出区，
+// 热路径不变，只有内存真爆掉时才落文件，磁盘也满才报错退出
 
 #include "definition.h"
 #include "SpinBackoff.h"
@@ -12,6 +14,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 #include <algorithm>
@@ -20,9 +23,16 @@
 
 // 系统头文件
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/vfs.h>
+#include <fcntl.h>
 #include <sched.h>
 #include <unistd.h>
 #include <errno.h>
+
+#ifndef TMPFS_MAGIC
+#define TMPFS_MAGIC 0x1021994
+#endif
 
 // NUMA 支持 - 自动检测 libnuma 是否可用
 #if __has_include(<numa.h>)
@@ -54,6 +64,16 @@ constexpr size_t REMOTE_LIST_CAPACITY = 32;
 
 // 大页大小（2MB）
 constexpr size_t HUGE_PAGE_SIZE = 2ULL * 1024 * 1024;
+
+// Spill 连续虚拟地址保留量（纯地址空间，不占内存/磁盘/commit 额度）
+constexpr size_t SPILL_VA_RESERVE = 1ULL << 40; // 1TB
+
+// Spill 提交块：2MB 起步、翻倍、封顶 512MB
+constexpr size_t SPILL_CHUNK_MIN = HUGE_PAGE_SIZE;
+constexpr size_t SPILL_CHUNK_MAX = 512ULL * 1024 * 1024;
+
+// find_arena_index 的 spill 哨兵返回值
+constexpr int SPILL_ARENA_INDEX = -2;
 
 //==============================================================================
 // 辅助工具
@@ -114,6 +134,42 @@ struct alignas(CACHE_LINE_SIZE) Arena
 };
 
 //==============================================================================
+// SpillArea - 全局磁盘溢出区
+//==============================================================================
+
+// 单一全局溢出区：一个文件、一段连续 VA、一个 bump cursor、一条全局 free list。
+// 构造时用 PROT_NONE 保留连续虚拟地址（无文件、无 IO）；
+// 首次真正溢出时才懒创建文件，并按几何增长的块（2MB 起步，封顶 512MB）
+// fallocate + MAP_FIXED 提交进保留区。文件页在 page cache，无 NUMA 归属。
+struct SpillArea
+{
+    char* va_base = nullptr;    // PROT_NONE 保留区原始起点（munmap 用）
+    size_t va_base_size = 0;    // 保留区原始大小
+    char* va_start = nullptr;   // 可用区起点（2MB 对齐）
+    size_t va_reserved = 0;     // 对齐后可用字节数
+
+    std::atomic<char*> committed_end{ nullptr }; // 已提交（已映射文件）边界
+    std::atomic<char*> bump_cursor{ nullptr };   // 已提交区内的 bump 指针
+
+    FreeBlock* free_list = nullptr; // 全局 spill 空闲链表
+    std::mutex free_mutex;          // 保护 free_list
+    std::mutex grow_mutex;          // 保护建文件 / 扩展 / 提交
+
+    int fd = -1;
+    std::string path;                    // temp_dir + "file_mapping.tmp"
+    size_t next_chunk = SPILL_CHUNK_MIN; // 几何增长当前块大小
+    size_t file_len = 0;                 // 已 fallocate 的文件长度（= 已提交字节数）
+
+    // O(1) 判断指针是否落在 spill 已提交区
+    bool contains(const void* p) const
+    {
+        const char* c = static_cast<const char*>(p);
+        return va_start && c >= va_start &&
+            c < committed_end.load(std::memory_order_acquire);
+    }
+};
+
+//==============================================================================
 // RemoteListHead - 远程链表头
 //==============================================================================
 
@@ -145,6 +201,9 @@ struct ThreadLocalCache
     // 远程链表数组，每个 Arena 一个
     // 用于暂存属于其他 Arena 的块
     alignas(CACHE_LINE_SIZE) RemoteListHead remote_lists[MAX_NUMA_NODES];
+
+    // spill 块暂存链表（spill 块全局唯一归属，不进 remote_lists）
+    RemoteListHead spill_remote;
 
     // 指向本地 Arena 的指针
     Arena* local_arena;
@@ -224,8 +283,26 @@ private:
     // 批量归还块到 Arena
     void batch_deallocate_to_arena(Arena& arena, FreeBlock* head, FreeBlock* tail, size_t count);
 
-    // 根据地址查找 Arena 索引
+    // 根据地址查找 Arena 索引（spill 块返回 SPILL_ARENA_INDEX）
     int find_arena_index(void* ptr) const;
+
+    // 保留 spill 连续虚拟地址（PROT_NONE，不建文件、无 IO）
+    void reserve_spill_va();
+
+    // 懒创建 spill 文件（调用方已持有 spill_.grow_mutex）
+    void ensure_spill_file_locked();
+
+    // 增长 spill 已提交区至少 need_bytes（调用方已持有 spill_.grow_mutex）
+    void grow_spill_locked(size_t need_bytes);
+
+    // spill bump 分配（内部按需 grow）；spill 禁用返回 nullptr，磁盘满报错退出
+    char* spill_bump(size_t bytes);
+
+    // 从 spill 批量获取 4KB 块（先 free list 后 bump），返回实际块数（0 = spill 禁用）
+    size_t spill_batch_allocate(FreeBlock** out_head, FreeBlock** out_tail, size_t count);
+
+    // 批量归还块到全局 spill 空闲链表
+    void batch_deallocate_to_spill(FreeBlock* head, FreeBlock* tail);
 
     // 获取当前线程应该使用的 Arena 索引
     int get_thread_arena_index() const;
@@ -260,6 +337,9 @@ private:
 
     // 总块数（Arena 初始化后计算）
     size_t total_blocks_;
+
+    // 全局磁盘溢出区
+    SpillArea spill_;
 
     // NUMA 是否可用
     bool numa_available_;
@@ -305,9 +385,13 @@ inline ThreadLocalCache::~ThreadLocalCache()
         local_free_stack = block->next;
         local_free_count--;
 
-        // 直接归还到对应的 Arena
+        // 直接归还到对应的 Arena（spill 块归还到全局 spill 空闲链表）
         int arena_idx = pool->find_arena_index(block);
-        if (arena_idx >= 0 && arena_idx < pool->num_arenas_)
+        if (arena_idx == SPILL_ARENA_INDEX)
+        {
+            pool->batch_deallocate_to_spill(block, block);
+        }
+        else if (arena_idx >= 0 && arena_idx < pool->num_arenas_)
         {
             Arena& arena = pool->arenas_[arena_idx];
             std::lock_guard<std::mutex> lock(arena.mutex);
@@ -340,6 +424,19 @@ inline ThreadLocalCache::~ThreadLocalCache()
         }
     }
 
+    // 归还 spill 暂存链表中的块
+    if (spill_remote.head)
+    {
+        FreeBlock* tail = spill_remote.head;
+        while (tail->next)
+        {
+            tail = tail->next;
+        }
+        pool->batch_deallocate_to_spill(spill_remote.head, tail);
+        spill_remote.head = nullptr;
+        spill_remote.count = 0;
+    }
+
     pool = nullptr;
 }
 
@@ -369,6 +466,9 @@ inline ConcurrentMemoryPool::ConcurrentMemoryPool(size_t total_bytes)
 
     // mmap 总内存，不做 first-touch，也不切分 Arena
     mmap_total_memory(total_bytes);
+
+    // 保留 spill 连续虚拟地址（PROT_NONE，不建文件、无 IO；失败仅禁用 spill）
+    reserve_spill_va();
 }
 
 inline ConcurrentMemoryPool::~ConcurrentMemoryPool()
@@ -391,6 +491,10 @@ inline ConcurrentMemoryPool::~ConcurrentMemoryPool()
             tls.remote_lists[i].count = 0;
         }
 
+        // 清空 spill 暂存链表
+        tls.spill_remote.head = nullptr;
+        tls.spill_remote.count = 0;
+
         tls.pool = nullptr;
     }
 
@@ -398,6 +502,21 @@ inline ConcurrentMemoryPool::~ConcurrentMemoryPool()
     {
         munmap(mmap_base_, mmap_size_);
         mmap_base_ = nullptr;
+    }
+
+    // 释放 spill：一次 munmap 覆盖整个保留区（文件映射与 PROT_NONE 一并解除），
+    // 然后关闭并删除临时文件。不 msync/fsync（临时内存，无持久化需求）。
+    if (spill_.va_base)
+    {
+        munmap(spill_.va_base, spill_.va_base_size);
+        spill_.va_base = nullptr;
+        spill_.va_start = nullptr;
+    }
+    if (spill_.fd >= 0)
+    {
+        close(spill_.fd);
+        unlink(spill_.path.c_str());
+        spill_.fd = -1;
     }
 }
 
@@ -916,7 +1035,286 @@ inline int ConcurrentMemoryPool::find_arena_index(void* ptr) const
             return i;
         }
     }
+    // 未命中匿名区，再查全局 spill 区（O(1) 范围判断）
+    if (spill_.contains(ptr))
+    {
+        return SPILL_ARENA_INDEX;
+    }
     return -1;
+}
+
+inline void ConcurrentMemoryPool::reserve_spill_va()
+{
+    size_t request = SPILL_VA_RESERVE + HUGE_PAGE_SIZE;
+    void* addr = mmap(nullptr, request,
+        PROT_NONE,
+        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE,
+        -1, 0);
+
+    if (addr == MAP_FAILED)
+    {
+        std::cerr << "spill: VA reserve failed, spill disabled" << std::endl;
+        spill_.va_base = nullptr;
+        spill_.va_start = nullptr;
+        spill_.va_reserved = 0;
+        return;
+    }
+
+    uintptr_t raw = reinterpret_cast<uintptr_t>(addr);
+    uintptr_t aligned = align_up(raw, HUGE_PAGE_SIZE);
+
+    spill_.va_base = static_cast<char*>(addr);
+    spill_.va_base_size = request;
+    spill_.va_start = reinterpret_cast<char*>(aligned);
+    spill_.va_reserved = request - (aligned - raw);
+
+    spill_.committed_end.store(spill_.va_start, std::memory_order_relaxed);
+    spill_.bump_cursor.store(spill_.va_start, std::memory_order_relaxed);
+}
+
+inline void ConcurrentMemoryPool::ensure_spill_file_locked()
+{
+    if (spill_.fd >= 0)
+    {
+        return;
+    }
+
+    spill_.path = temp_dir + "file_mapping.tmp";
+
+    // best effort：temp_dir 可能尚未创建（默认单层目录，嵌套路径失败则由 open 报错）
+    mkdir(temp_dir.c_str(), 0755);
+
+    // O_TRUNC 顺手清掉上次崩溃残留的文件内容（目录唯一性由用户保证）
+    spill_.fd = open(spill_.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (spill_.fd < 0)
+    {
+        std::cerr << "spill: cannot create " << spill_.path << ": " << strerror(errno) << std::endl;
+        std::exit(-1);
+    }
+
+    // tmpfs 上的文件占内存不占磁盘，违背 spill 初衷；警告但不退出
+    struct statfs sfs;
+    if (fstatfs(spill_.fd, &sfs) == 0 &&
+        static_cast<unsigned long>(sfs.f_type) == static_cast<unsigned long>(TMPFS_MAGIC))
+    {
+        std::cerr << "spill: warning: " << spill_.path << " is on tmpfs (RAM-backed), "
+            "spilling will not relieve memory pressure" << std::endl;
+    }
+
+    std::cerr << "spill: activated, backing file " << spill_.path << std::endl;
+}
+
+inline void ConcurrentMemoryPool::grow_spill_locked(size_t need_bytes)
+{
+    while (need_bytes > 0)
+    {
+        // 保留区耗尽（1TB）：不能继续提交——MAP_FIXED 会静默替换保留区之外的
+        // 已有映射，越界前必须报错退出（与磁盘满同等处理）
+        size_t remaining = spill_.va_reserved - spill_.file_len;
+        if (remaining < SPILL_CHUNK_MIN)
+        {
+            std::cerr << "spill: VA reservation exhausted, cannot grow "
+                << spill_.path << std::endl;
+            std::exit(-1);
+        }
+
+        size_t chunk = std::min(spill_.next_chunk, remaining);
+
+        for (;;)
+        {
+            if (fallocate(spill_.fd, 0,
+                static_cast<off_t>(spill_.file_len),
+                static_cast<off_t>(chunk)) == 0)
+            {
+                break;
+            }
+
+            if (errno == ENOSPC)
+            {
+                if (chunk <= SPILL_CHUNK_MIN)
+                {
+                    std::cerr << "spill: disk full, cannot grow " << spill_.path << std::endl;
+                    std::exit(-1);
+                }
+                // 磁盘将满：减半重试，尽量挤出剩余空间
+                chunk = std::max(chunk / 2, SPILL_CHUNK_MIN);
+                continue;
+            }
+
+            if (errno == EOPNOTSUPP || errno == ENOSYS)
+            {
+                // 文件系统不支持 fallocate，回退稀疏模式（磁盘满时会 SIGBUS，仅警告一次）
+                static bool sparse_warned = false;
+                if (!sparse_warned)
+                {
+                    sparse_warned = true;
+                    std::cerr << "spill: warning: fallocate unsupported on " << spill_.path
+                        << ", falling back to sparse file (SIGBUS risk if disk fills)" << std::endl;
+                }
+                if (ftruncate(spill_.fd, static_cast<off_t>(spill_.file_len + chunk)) != 0)
+                {
+                    std::cerr << "spill: ftruncate failed: " << strerror(errno) << std::endl;
+                    std::exit(-1);
+                }
+                break;
+            }
+
+            std::cerr << "spill: fallocate failed: " << strerror(errno) << std::endl;
+            std::exit(-1);
+        }
+
+        // 提交进保留区：目标地址当前是 PROT_NONE，没有任何线程能持有其指针
+        void* addr = mmap(spill_.va_start + spill_.file_len, chunk,
+            PROT_READ | PROT_WRITE,
+            MAP_SHARED | MAP_FIXED,
+            spill_.fd, static_cast<off_t>(spill_.file_len));
+
+        if (addr == MAP_FAILED)
+        {
+            std::cerr << "spill: mmap commit failed: " << strerror(errno) << std::endl;
+            std::exit(-1);
+        }
+
+        spill_.file_len += chunk;
+        spill_.next_chunk = std::min(spill_.next_chunk * 2, SPILL_CHUNK_MAX);
+
+        std::cerr << "spill: committed " << (spill_.file_len >> 20) << " MB" << std::endl;
+
+        need_bytes = (need_bytes > chunk) ? (need_bytes - chunk) : 0;
+    }
+
+    // release 发布新边界，保证其他线程看到边界前移时已映射完成
+    spill_.committed_end.store(spill_.va_start + spill_.file_len, std::memory_order_release);
+}
+
+inline char* ConcurrentMemoryPool::spill_bump(size_t bytes)
+{
+    if (!spill_.va_start || bytes == 0)
+    {
+        return nullptr;
+    }
+
+    size_t aligned_bytes = align_up(bytes, BLOCK_SIZE);
+    SpinBackoff backoff;
+
+    for (;;)
+    {
+        char* cursor = spill_.bump_cursor.load(std::memory_order_relaxed);
+        char* committed = spill_.committed_end.load(std::memory_order_acquire);
+        size_t available = static_cast<size_t>(committed - cursor);
+
+        if (aligned_bytes <= available)
+        {
+            char* next = cursor + aligned_bytes;
+            if (spill_.bump_cursor.compare_exchange_weak(cursor, next,
+                std::memory_order_relaxed, std::memory_order_relaxed))
+            {
+                return cursor;
+            }
+            backoff.backoff();
+            continue;
+        }
+
+        // 已提交空间不足：double-checked grow（罕见路径，mutex 无瓶颈）
+        {
+            std::lock_guard<std::mutex> lock(spill_.grow_mutex);
+            committed = spill_.committed_end.load(std::memory_order_acquire);
+            size_t avail = static_cast<size_t>(committed - cursor);
+            if (avail < aligned_bytes)
+            {
+                ensure_spill_file_locked();
+                grow_spill_locked(aligned_bytes - avail);
+            }
+            // 否则其他线程已 grow 出足够空间，走外层循环重试 CAS
+        }
+    }
+}
+
+inline size_t ConcurrentMemoryPool::spill_batch_allocate(FreeBlock** out_head, FreeBlock** out_tail, size_t count)
+{
+    if (!spill_.va_start || count == 0)
+    {
+        return 0;
+    }
+
+    FreeBlock* head = nullptr;
+    FreeBlock* tail = nullptr;
+    size_t fetched = 0;
+
+    // 1. 优先复用全局 spill 空闲链表（已释放块优先，无块才 grow 新空间）
+    {
+        std::lock_guard<std::mutex> lock(spill_.free_mutex);
+
+        if (spill_.free_list)
+        {
+            head = spill_.free_list;
+            tail = head;
+            fetched = 1;
+
+            while (tail->next && fetched < count)
+            {
+                tail = tail->next;
+                ++fetched;
+            }
+
+            spill_.free_list = tail->next;
+            tail->next = nullptr;
+        }
+    }
+
+    // 2. 不足部分从 spill bump 补齐（bump 是全有或全无：要么够，要么 grow/退出）
+    if (fetched < count)
+    {
+        size_t want = count - fetched;
+        char* mem = spill_bump(want * BLOCK_SIZE);
+        if (!mem)
+        {
+            // 理论上不可达（入口已检查 va_start）；稳妥起见把已摘块挂回
+            if (head)
+            {
+                std::lock_guard<std::mutex> lock(spill_.free_mutex);
+                tail->next = spill_.free_list;
+                spill_.free_list = head;
+            }
+            return 0;
+        }
+
+        FreeBlock* bump_head = reinterpret_cast<FreeBlock*>(mem);
+        FreeBlock* bump_tail = bump_head;
+        for (size_t i = 1; i < want; ++i)
+        {
+            FreeBlock* block = reinterpret_cast<FreeBlock*>(mem + i * BLOCK_SIZE);
+            bump_tail->next = block;
+            bump_tail = block;
+        }
+        bump_tail->next = nullptr;
+
+        if (head)
+        {
+            tail->next = bump_head;
+            tail = bump_tail;
+        }
+        else
+        {
+            head = bump_head;
+            tail = bump_tail;
+        }
+        fetched = count;
+    }
+
+    *out_head = head;
+    *out_tail = tail;
+    return fetched;
+}
+
+inline void ConcurrentMemoryPool::batch_deallocate_to_spill(FreeBlock* head, FreeBlock* tail)
+{
+    if (!head || !tail)
+        return;
+
+    std::lock_guard<std::mutex> lock(spill_.free_mutex);
+    tail->next = spill_.free_list;
+    spill_.free_list = head;
 }
 
 inline int ConcurrentMemoryPool::get_thread_arena_index() const
@@ -982,6 +1380,14 @@ inline void* ConcurrentMemoryPool::allocate_large(size_t bytes)
         }
     }
 
+    // 所有 Arena 的匿名内存耗尽：进入全局 spill 区（按需 grow，磁盘满才报错退出）
+    ptr = spill_bump(bytes);
+    if (ptr)
+    {
+        return ptr;
+    }
+
+    // spill 禁用（VA 保留失败）：保持原有失败行为
     std::cerr << "std::bad_alloc" << std::endl;
     std::exit(-1);
 }
@@ -1056,7 +1462,22 @@ inline void* ConcurrentMemoryPool::allocate()
         }
     }
 
-    // 4. 所有 Arena 都为空
+    // 4. 所有 Arena 的匿名内存都耗尽：进入全局 spill 区
+    // （先复用 spill 空闲链表，无块才 bump/grow 新文件空间）
+    fetched = spill_batch_allocate(&head, &tail, BATCH_SIZE);
+    if (fetched > 0)
+    {
+        FreeBlock* result = head;
+
+        // 与本地 refill 分支保持一致：直接挂接剩余链表
+        tls.local_free_stack = head->next;
+        result->next = nullptr;
+        tls.local_free_count = fetched - 1;
+
+        return result;
+    }
+
+    // 5. spill 禁用（VA 保留失败）：保持原有失败行为
     std::cerr << "std::bad_alloc" << std::endl;
     std::exit(-1);
 }
@@ -1086,6 +1507,33 @@ inline void ConcurrentMemoryPool::deallocate(void* ptr)
 
     // 查找块属于哪个 Arena
     int arena_idx = find_arena_index(ptr);
+
+    if (arena_idx == SPILL_ARENA_INDEX) [[unlikely]]
+    {
+        // spill 块：暂存到 TLS spill 链表，攒满批量归还全局 spill 空闲链表
+        RemoteListHead& rl = tls.spill_remote;
+        block->next = rl.head;
+        rl.head = block;
+        rl.count++;
+
+        if (rl.count >= REMOTE_LIST_CAPACITY)
+        {
+            FreeBlock* head = rl.head;
+            // 找到尾节点
+            FreeBlock* tail = head;
+            while (tail->next)
+            {
+                tail = tail->next;
+            }
+
+            batch_deallocate_to_spill(head, tail);
+
+            rl.head = nullptr;
+            rl.count = 0;
+        }
+        return;
+    }
+
     if (arena_idx < 0) [[unlikely]]
     {
         // 不属于任何 Arena，可能是无效指针

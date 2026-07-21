@@ -62,6 +62,13 @@ else()
 endif()
 add_test(NAME ConcurrentMapTest COMMAND concurrent_map_test 1000 10)
 
+add_executable(memory_pool_spill_test tests/test_memory_pool_spill.cpp)
+target_link_libraries(memory_pool_spill_test pthread)
+if(HAVE_NUMA_H)
+    target_link_libraries(memory_pool_spill_test numa)
+endif()
+add_test(NAME MemoryPoolSpillTest COMMAND memory_pool_spill_test)
+
 add_executable(export_reader_test tests/test_export_reader.cpp)
 target_link_libraries(export_reader_test rt)
 target_link_libraries(export_reader_test pthread)
