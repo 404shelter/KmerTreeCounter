@@ -39,7 +39,7 @@ public:
         local_sorted_kmer_count(0),
         k(in_k), tail_bits(2 * (k % BASES_PER_U64T)), tail_bytes((tail_bits + 7) / 8), full_words(k / BASES_PER_U64T),
         kmer_bytes(full_words * sizeof(uint64_t) + tail_bytes),
-        total_bytes(static_cast<uint32_t>(kmer_bytes + sizeof(uint32_t))),
+        total_bytes(static_cast<uint32_t>(kmer_bytes + count_max_bytes)),
         mask((~uint64_t{ 0 }) << (64 - tail_bits)),
         pool_(pool), current_block_(nullptr), current_offset_(0)
     {
@@ -77,8 +77,8 @@ public:
             reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
         current_offset_ += tail_bytes;
 
-        std::memcpy(current_block_ + current_offset_, &count, sizeof(uint32_t));
-        current_offset_ += sizeof(uint32_t);
+        std::memcpy(current_block_ + current_offset_, &count, count_max_bytes);
+        current_offset_ += count_max_bytes;
     }
 
     void write_map_record(const concurrent_node<N>* nodes, const uint32_t count)
@@ -106,8 +106,8 @@ public:
                 reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
             current_offset_ += tail_bytes;
 
-            std::memcpy(current_block_ + current_offset_, &rec_count, sizeof(uint32_t));
-            current_offset_ += sizeof(uint32_t);
+            std::memcpy(current_block_ + current_offset_, &rec_count, count_max_bytes);
+            current_offset_ += count_max_bytes;
         }
 
         if (first_to_write < count) [[unlikely]]
@@ -133,8 +133,8 @@ public:
                     reinterpret_cast<const char*>(&tail_data) + (8 - tail_bytes), tail_bytes);
                 current_offset_ += tail_bytes;
 
-                std::memcpy(current_block_ + current_offset_, &rec_count, sizeof(uint32_t));
-                current_offset_ += sizeof(uint32_t);
+                std::memcpy(current_block_ + current_offset_, &rec_count, count_max_bytes);
+                current_offset_ += count_max_bytes;
             }
         }
     }

@@ -559,6 +559,32 @@ int main(int argc, char* argv[])
 
     MAX_BLOOM_FILTER_CAPACITY = std::bit_ceil(std::max<uint64_t>(MIN_BLOOM_FILTER_CAPACITY, memory_limit * 1024ULL * 1024ULL * 1024ULL / (4 * 8) / (1ULL << (2 * ROOT_BASES))));
 
+    int fd = ::open((temp_dir + "infos.bin").c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd == -1) {
+        std::cerr << "Open infos.bin failed : " << strerror(errno) << std::endl;
+        return 1;
+    }
+    ::write(fd, &k_len, sizeof(k_len));
+    ::write(fd, &count_max, sizeof(count_max));
+    ::close(fd);
+    
+    if (count_max <= 0xFF)
+    {
+        count_max_bytes = 1;
+    }
+    else if (count_max <= 0xFFFF)
+    {
+        count_max_bytes = 2;
+
+    }
+    else if (count_max <= 0xFFFFFF)
+    {
+        count_max_bytes = 3;
+    }
+    else
+    {
+        count_max_bytes = 4;
+    }
 
     if (k_len <= 32)
     {
@@ -575,6 +601,6 @@ int main(int argc, char* argv[])
     else
     {
         std::cerr << "k_len must be <= 128" << std::endl;
-        return 1; 
+        return 1;
     }
 }
