@@ -80,8 +80,9 @@ constexpr uint32_t TASK_ENQUEUE_RETRY_LIMIT = 1ULL << 7;
 constexpr uint64_t DRAIN_EXPORT_BUFFER_SIZE = 2 * 1024 * 1024; // final drain 导出缓冲区大小（字节）
 
 // k-mer 计数过滤区间（闭区间）
-inline uint32_t min_count = 1;
-inline uint32_t max_count = std::numeric_limits<uint32_t>::max();
+inline uint32_t filter_min = 2;
+inline uint32_t filter_max = std::numeric_limits<uint32_t>::max();
+inline uint32_t count_max  = 255;
 
 // KmerTree的哈希表大小
 inline uint32_t kmer_concurrent_hash_map_capacity = 1024;
