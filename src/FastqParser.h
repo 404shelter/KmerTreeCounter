@@ -46,7 +46,7 @@ class FastqParser
 
     std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>> classifier_task_queues;
     MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* global_classifier_task_queue;
-    SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* reader_parser_ring_pool;
+    RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* reader_parser_ring_pool;
     RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* parser_classifier_ring_pool;
 
     alignas(CACHE_LINE_SIZE) std::array<uint8_t, 1ULL << (2 * ROOT_BASES)> local_prefix_owners{};
@@ -82,7 +82,7 @@ public:
     explicit FastqParser(uint32_t in_k_len,
         std::vector<std::shared_ptr<MPSCRingQueue<content_type, CLASSIFIER_TASK_QUEUES_CAPACITY>>>& in_classifier_task_queues,
         MPMCRingQueue<content_type, GLOBAL_CLASSIFIER_TASK_QUEUE_CAPACITY>* in_global_classifier_task_queue,
-        SPMCRingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_reader_parser_ring_pool,
+        RingMemoryPool<READER_PARSER_RING_MEMORY_POOL_CAPACITY>* in_reader_parser_ring_pool,
         RingMemoryPool<PARSER_CLASSIFIER_RING_MEMORY_POOL_CAPACITY>* in_parser_classifier_ring_pool)
         : k_len(in_k_len), classifier_task_queues(in_classifier_task_queues),
         global_classifier_task_queue(in_global_classifier_task_queue), reader_parser_ring_pool(in_reader_parser_ring_pool), parser_classifier_ring_pool(in_parser_classifier_ring_pool), get_kmer(in_k_len)
@@ -99,7 +99,7 @@ public:
     void parse_and_push()
     {
         content_type reader_parser_content;
-        bool not_empty = true;
+        // bool not_empty = true;
 
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
@@ -110,8 +110,71 @@ public:
             owner_contents[i].length = 0;
         }
 
+
+        while (true)
+        {
+            if (!reader_parser_ring_pool->producer_finished()) [[likely]]
+            {
+                if (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
+                {
+
+#ifdef TEST_MODE
+                    not_first_flag = true;
+#endif
+
+                    dequeue_backoff.double_decay();
+
+                    parse(reader_parser_content.data, reader_parser_content.length);
+
+                    if (reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                    {
+                        // enqueue 无等待
+                        enqueue_backoff.double_decay();
+                    }
+                    else
+                    {
+                        // enqueue 等待
+                        enqueue_backoff.backoff();
+
+                        while (!reader_parser_ring_pool->consumer_try_enqueue(reader_parser_content.data))
+                        {
+
+#ifdef TEST_MODE
+                            consumer_enqueue_spin_time++;
+#endif
+
+                            enqueue_backoff.backoff();
+                        }
+
+                        enqueue_backoff.decay();
+                    }
+                }
+                else
+                {
+
+#ifdef TEST_MODE
+                    if (not_first_flag)
+                        consumer_dequeue_spin_time++;
+#endif
+
+                    dequeue_backoff.backoff();
+                }
+            }
+            else
+            {
+                while (reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content))
+                {
+                    parse(reader_parser_content.data, reader_parser_content.length);
+                    reader_parser_ring_pool->consumer_enqueue(reader_parser_content.data);
+                }
+                break;
+            }
+        }
+
+        // above is new
+
         // 当队列确实为空且生产者已结束时才退出循环
-        while (not_empty || !reader_parser_ring_pool->producer_finished())
+        /*while (not_empty || !reader_parser_ring_pool->producer_finished())
         {
             not_empty = reader_parser_ring_pool->consumer_try_dequeue(reader_parser_content);
             if (not_empty)
@@ -158,7 +221,7 @@ public:
                 dequeue_backoff.backoff();
 
             }
-        }
+        }*/
 
         flush_kmer_buffer();
 
@@ -554,7 +617,13 @@ private:
 
         if (classifier_task_queues[owner_id]->try_enqueue(owner_contents[owner_id]))
         {
-            enqueue_to_classifier_backoff.decay();
+            enqueue_to_classifier_backoff.double_decay();
+            return;
+        }
+
+        if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
+        {
+            enqueue_to_classifier_backoff.double_decay();
             return;
         }
 
@@ -571,7 +640,6 @@ private:
             {
                 break;
             }
-            enqueue_to_classifier_backoff.backoff();
             if (global_classifier_task_queue->try_enqueue(owner_contents[owner_id]))
             {
                 break;
@@ -579,6 +647,8 @@ private:
             enqueue_to_classifier_backoff.backoff();
 
         }
+
+        enqueue_to_classifier_backoff.decay();
     }
 
     void dequeue_data_from_classifier(char*& data)
@@ -586,7 +656,7 @@ private:
 
         if (parser_classifier_ring_pool->producer_try_dequeue(data))
         {
-            dequeue_from_classifier_backoff.decay();
+            dequeue_from_classifier_backoff.double_decay();
             return;
         }
 
@@ -602,6 +672,8 @@ private:
             dequeue_from_classifier_backoff.backoff();
 
         }
+
+        dequeue_from_classifier_backoff.decay();
     }
 };
 

@@ -67,6 +67,8 @@ public:
     uint64_t consumer_enqueue_spin_time{ 0 };
     uint64_t consumer_dequeue_spin_time{ 0 };
     bool not_first_flag = false;
+    uint64_t total_kmers_exported = 0;
+    uint64_t total_kmers_send_to_tree = 0;
 #endif
 
     explicit FastqClassifier(uint32_t in_k_len,
@@ -119,12 +121,99 @@ public:
     void classify_and_push()
     {
         content_type content;
-        bool not_empty = true;
+        //bool not_empty = true;
 
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> enqueue_backoff;
         SpinBackoff<MAX_BACKOFF, YIELD_THRESHOLD, SLEEP_THRESHOLD> dequeue_backoff;
 
-        while (not_empty || !parser_classifier_ring_pool->producer_finished())
+        while (true)
+        {
+            if (!parser_classifier_ring_pool->producer_finished()) [[likely]]
+            {
+                bool not_empty = classify_task_queue->try_dequeue(content);
+                if (!not_empty)
+                {
+                    not_empty = global_classifier_task_queue->try_dequeue(content);
+                }
+
+                if (not_empty)
+                {
+
+#ifdef TEST_MODE
+                    not_first_flag = true;
+#endif
+
+                    dequeue_backoff.double_decay();
+
+
+                    kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
+                    const uint64_t kmer_count = content.length; // length 就是 k-mer数量
+                    if (local_prefix_owners[get_root_prefix(kmer_data[0])] == classifier_index) [[likelyF]]
+                    {
+                        process_owned_block(kmer_data, kmer_count);
+                    }
+                    else
+                    {
+                        process_other_block(kmer_data, kmer_count);
+                    }
+
+                    if (parser_classifier_ring_pool->consumer_try_enqueue(content.data))
+                    {
+                        // 无等待
+                        enqueue_backoff.double_decay();
+                    }
+                    else
+                    {
+                        // 自旋等待
+                        enqueue_backoff.backoff();
+
+                        while (!parser_classifier_ring_pool->consumer_try_enqueue(content.data))
+                        {
+#ifdef TEST_MODE
+                            consumer_enqueue_spin_time++;
+#endif
+                            enqueue_backoff.backoff();
+                        }
+
+                        enqueue_backoff.decay();
+                    }
+                }
+                else
+                {
+
+#ifdef TEST_MODE
+                    if (not_first_flag)
+                        consumer_dequeue_spin_time++;
+#endif
+
+                    dequeue_backoff.backoff();
+                }
+            }
+            else
+            {
+                while (classify_task_queue->try_dequeue(content))
+                {
+                    kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
+                    const uint64_t kmer_count = content.length; // length 就是 k-mer数量
+                    process_owned_block(kmer_data, kmer_count);
+                    parser_classifier_ring_pool->consumer_enqueue(content.data);
+                }
+
+                while (global_classifier_task_queue->try_dequeue(content))
+                {
+                    kmer<N>* kmer_data = reinterpret_cast<kmer<N> *>(content.data);
+                    const uint64_t kmer_count = content.length; // length 就是 k-mer数量
+                    process_other_block(kmer_data, kmer_count);
+                    parser_classifier_ring_pool->consumer_enqueue(content.data);
+                }
+
+                break;
+            }
+        }
+
+        //above is new
+
+        /*while (not_empty || !parser_classifier_ring_pool->producer_finished())
         {
 
             not_empty = classify_task_queue->try_dequeue(content);
@@ -183,7 +272,7 @@ public:
 
                 dequeue_backoff.backoff();
             }
-        }
+        }*/
 
         enqueue_content_to_export_writer({ reinterpret_cast<char*>(export_block_ptr), export_kmer_block_count });
         export_kmer_block_count = 0;
@@ -287,6 +376,11 @@ private:
                 }
 
                 local_block_prefix_counts[prefix] -= prefix_export_count;
+
+#ifdef TEST_MODE
+                total_kmers_exported += prefix_export_count;
+                total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+#endif
                 continue;
             }
 
@@ -339,11 +433,14 @@ private:
 
             read_offset += prefix_count;
             local_block_prefix_counts[prefix] -= prefix_export_count;
+#ifdef TEST_MODE
+            total_kmers_exported += prefix_export_count;
+            total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+#endif
         }
 
         if (local_block_count > 0) [[likely]]
         {
-
             tree->main_add_kmer_block_with_local_root_nodes(local_block_for_copy, local_block_prefix_counts, local_root_nodes.data());
         }
     }
@@ -472,6 +569,10 @@ private:
 
             //read_offset += prefix_count;
             local_block_prefix_counts[prefix] -= prefix_export_count;
+#ifdef TEST_MODE
+            total_kmers_exported += prefix_export_count;
+            total_kmers_send_to_tree += local_block_prefix_counts[prefix];
+#endif
         }
 
         if (local_block_count > 0) [[likely]]
@@ -493,7 +594,7 @@ private:
 
         if (export_pool->producer_try_enqueue(content))
         {
-            enqueue_to_export_writer_backoff.decay();
+            enqueue_to_export_writer_backoff.double_decay();
             return;
         }
 
@@ -505,6 +606,8 @@ private:
 #endif
             enqueue_to_export_writer_backoff.backoff();
         }
+
+        enqueue_to_export_writer_backoff.decay();
     }
 
     void dequeue_data_to_export_writer(char*& data)
@@ -513,7 +616,7 @@ private:
 
         if (export_pool->producer_try_dequeue(data))
         {
-            dequeue_from_export_writer_backoff.decay();
+            dequeue_from_export_writer_backoff.double_decay();
             return;
         }
 
@@ -525,6 +628,8 @@ private:
 #endif
             dequeue_from_export_writer_backoff.backoff();
         }
+
+        dequeue_from_export_writer_backoff.decay();
     }
 };
 

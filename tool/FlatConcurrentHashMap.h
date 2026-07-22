@@ -131,6 +131,7 @@ public:
 
     void seal() noexcept
     {
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         for (uint64_t i = 0; i < GROUP_SIZE - 1; ++i)
         {
             ctrl_[static_cast<size_t>(capacity_ + i)] = ctrl_[static_cast<size_t>(i)];
@@ -203,6 +204,42 @@ public:
         return false;
     }
 
+    bool find_prepared_slot(const kmer<N>& key, const PreparedLookup& lookup,
+                            uint32_t& out_count, uint64_t& out_slot) const noexcept
+    {
+        const uint8_t fp = lookup.fp;
+        uint64_t base = lookup.base;
+
+        for (uint64_t probe = 0; probe < group_count_; ++probe)
+        {
+            const auto masks = match_and_empty(base, fp);
+            uint32_t match_mask = masks.first;
+            const uint32_t empty_mask = masks.second;
+
+            while (match_mask != 0)
+            {
+                const uint32_t bit = static_cast<uint32_t>(__builtin_ctz(match_mask));
+                const uint64_t slot = wrap_slot(base + bit);
+                const kmer<N>& k_mer = kmer_[slot];
+                if (k_mer == key) [[likely]]
+                {
+                    out_count = count_[slot];
+                    out_slot = slot;
+                    return true;
+                }
+                match_mask &= match_mask - 1;
+            }
+
+            if (empty_mask != 0)
+            {
+                return false;
+            }
+            base = next_group_base(base);
+        }
+
+        return false;
+    }
+
     bool contains(const kmer<N>& key) const noexcept
     {
         uint32_t ignored = 0;
@@ -217,6 +254,28 @@ public:
     uint64_t capacity() const noexcept
     {
         return capacity_;
+    }
+
+    template <typename Func>
+    void for_each_entry(Func&& func) const
+    {
+        for (uint64_t i = 0; i < capacity_; ++i)
+        {
+            if (ctrl_[i] != 0)
+            {
+                func(kmer_[i], count_[i]);
+            }
+        }
+    }
+
+    uint32_t* mutable_count_at(uint64_t slot)
+    {
+        return &count_[slot];
+    }
+
+    const uint32_t* count_at(uint64_t slot) const
+    {
+        return &count_[slot];
     }
 
 private:

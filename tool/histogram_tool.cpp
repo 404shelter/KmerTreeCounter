@@ -224,62 +224,17 @@ namespace
         return tmp_dir + "root_" + std::to_string(root_id) + ".bin";
     }
 
+    [[nodiscard]] std::string thread_filename(const std::string& tmp_dir, const uint64_t thread_id)
+    {
+        return tmp_dir + "thread_" + std::to_string(thread_id) + ".bin";
+    }
+
     void close_fd(const int fd) noexcept
     {
         if (fd >= 0)
         {
             ::close(fd);
         }
-    }
-
-    template <uint32_t N>
-    [[nodiscard]] std::vector<RootFileInfo> collect_root_files(const std::string& tmp_dir, uint64_t& expected_unique_insert)
-    {
-        std::vector<RootFileInfo> root_files;
-        root_files.reserve(ROOT_BUCKET_COUNT);
-        expected_unique_insert = 0;
-
-        for (uint64_t root_id = 0; root_id < ROOT_BUCKET_COUNT; ++root_id)
-        {
-            const std::string filename = root_filename(tmp_dir, root_id);
-            const int fd = ::open(filename.c_str(), O_RDONLY);
-            if (fd < 0)
-            {
-                if (errno == ENOENT)
-                {
-                    continue;
-                }
-                std::cerr << "failed to open " << filename << ": " << std::strerror(errno) << std::endl;
-                exit(-1);
-            }
-
-            struct stat st
-            {
-            };
-            if (::fstat(fd, &st) != 0)
-            {
-                close_fd(fd);
-                std::cerr << "failed to stat " << filename << ": " << std::strerror(errno) << std::endl;
-                exit(-1);
-            }
-            close_fd(fd);
-
-            const uint64_t file_size = static_cast<uint64_t>(st.st_size);
-            if (file_size % sizeof(ExportRecord<N>) != 0)
-            {
-                std::cerr << "invalid root file size for " << filename << std::endl;
-                exit(-1);
-            }
-
-            const uint64_t record_count = file_size / sizeof(ExportRecord<N>);
-            expected_unique_insert = expected_unique_insert + record_count;
-            if (record_count > 0)
-            {
-                root_files.push_back(RootFileInfo{ filename, record_count, file_size });
-            }
-        }
-
-        return root_files;
     }
 
     template <uint32_t N>
@@ -295,6 +250,37 @@ namespace
             exit(-1);
         }
         return packed_kmer_bytes;
+    }
+    
+    template <uint32_t N>
+    [[nodiscard]] std::vector<RootFileInfo> collect_thread_files(
+        const std::string& tmp_dir, uint64_t& expected_unique_insert, uint32_t k_len)
+    {
+        const uint64_t compact_record_size = packed_kmer_bytes_for_k<N>(k_len) + sizeof(uint32_t);
+        std::vector<RootFileInfo> thread_files;
+
+        for (uint64_t thread_id = 0; ; ++thread_id)
+        {
+            const std::string filename = thread_filename(tmp_dir, thread_id);
+            const int fd = ::open(filename.c_str(), O_RDONLY);
+            if (fd < 0) break;
+
+            struct stat st{};
+            if (::fstat(fd, &st) != 0) { close_fd(fd); break; }
+            close_fd(fd);
+
+            const uint64_t file_size = static_cast<uint64_t>(st.st_size);
+            if (file_size == 0) continue;
+            if (file_size % compact_record_size != 0)
+            {
+                std::cerr << "invalid thread file size for " << filename << std::endl;
+                exit(-1);
+            }
+            const uint64_t record_count = file_size / compact_record_size;
+            expected_unique_insert += record_count;
+            thread_files.push_back(RootFileInfo{ filename, record_count, file_size });
+        }
+        return thread_files;
     }
 
     template <uint32_t N>
@@ -355,15 +341,17 @@ namespace
     void enqueue_high_records(
         const std::vector<RootFileInfo>& root_files,
         SPMCRingMemoryPool<HISTOGRAM_RING_CAPACITY>& pool,
+        uint32_t k_len,
         ProgressPrinter* progress)
     {
         using Record = ExportRecord<N>;
         constexpr uint64_t RECORDS_PER_BLOCK = HISTOGRAM_BLOCK_BYTES / sizeof(Record);
         static_assert(RECORDS_PER_BLOCK > 0, "histogram high-frequency block is too small");
+        const uint64_t compact_rec_size = packed_kmer_bytes_for_k<N>(k_len) + sizeof(uint32_t);
 
         for (const RootFileInfo& root_file : root_files)
         {
-            FinalDrainReader<N> reader;
+            FinalDrainReader<N> reader(k_len);
             reader.open(root_file.filename);
 
             while (!reader.finished())
@@ -377,7 +365,7 @@ namespace
                     pool.consumer_enqueue(block_ptr);
                     break;
                 }
-                progress->add(count * sizeof(Record));
+                progress->add(count * compact_rec_size);
 
                 pool.producer_enqueue(content_type{ block_ptr, count });
             }
@@ -451,7 +439,7 @@ namespace
         const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
 
         uint64_t expected_unique_insert = 0;
-        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert);
+        auto root_files = collect_thread_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
         uint64_t high_file_bytes = 0;
         for (const RootFileInfo& root_file : root_files)
         {
@@ -492,7 +480,7 @@ namespace
                 hist_size);
 
             high_threads.start();
-            enqueue_high_records<N>(root_files, high_pool, &progress);
+            enqueue_high_records<N>(root_files, high_pool, options.k_len, &progress);
             high_threads.join();
 
             if (high_threads.insert_failed())
@@ -556,7 +544,7 @@ namespace
         const uint32_t worker_count = std::max<uint32_t>(1, options.max_threads);
 
         uint64_t expected_unique_insert = 0;
-        const std::vector<RootFileInfo> root_files = collect_root_files<N>(options.tmp_dir, expected_unique_insert);
+        auto root_files = collect_thread_files<N>(options.tmp_dir, expected_unique_insert, options.k_len);
         uint64_t high_file_bytes = 0;
         for (const RootFileInfo& root_file : root_files)
         {
@@ -582,7 +570,7 @@ namespace
                 hist_size);
 
             approximate_threads.start();
-            enqueue_high_records<N>(root_files, approximate_pool, &progress);
+            enqueue_high_records<N>(root_files, approximate_pool, options.k_len, &progress);
             approximate_threads.join();
         }
 

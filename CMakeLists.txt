@@ -23,11 +23,23 @@ file(GLOB_RECURSE SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
 )
 
-find_package(ZLIB REQUIRED)
+#zlib-ng配置
+set(BUILD_SHARED_LIBS OFF)
+set(ZLIB_COMPAT ON)
+set(WITH_NATIVE_INSTRUCTIONS ON)
+set(WITH_OPTIM ON)
+set(WITH_GZFILEOP ON)
+#set(WITH_AVX512 OFF)
+#set(WITH_AVX512VNNI OFF)
+#set(WITH_VPCLMULQDQ OFF)
+set(ZLIB_ENABLE_TESTS OFF)
+set(ZLIB_ENABLE_EXAMPLES OFF)
+
+add_subdirectory(third_party/zlib-ng)
 
 add_executable(${PROJECT_NAME} ${SOURCES})
 
-target_link_libraries(${PROJECT_NAME} ZLIB::ZLIB)
+target_link_libraries(${PROJECT_NAME} zlib)
 target_link_libraries(${PROJECT_NAME} rt)
 target_link_libraries(${PROJECT_NAME} pthread)
 
@@ -83,6 +95,13 @@ target_link_libraries(histogram_tool rt)
 target_link_libraries(histogram_tool pthread)
 if(HAVE_NUMA_H)
     target_link_libraries(histogram_tool numa)
+endif()
+
+add_executable(dump_tool tool/dump_tool.cpp)
+target_link_libraries(dump_tool rt)
+target_link_libraries(dump_tool pthread)
+if(HAVE_NUMA_H)
+    target_link_libraries(dump_tool numa)
 endif()
 
 add_executable(histogram_tool_test tests/test_histogram_tool.cpp)

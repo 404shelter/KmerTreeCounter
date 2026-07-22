@@ -1,7 +1,7 @@
 #ifndef TREE_DEFINITION_HEADER
 #define TREE_DEFINITION_HEADER
 
-#define TEST_MODE
+// #define TEST_MODE
 
 #include "SpinLock.h"
 
@@ -80,8 +80,10 @@ constexpr uint32_t TASK_ENQUEUE_RETRY_LIMIT = 1ULL << 7;
 constexpr uint64_t DRAIN_EXPORT_BUFFER_SIZE = 2 * 1024 * 1024; // final drain 导出缓冲区大小（字节）
 
 // k-mer 计数过滤区间（闭区间）
-inline uint32_t min_count = 1;
-inline uint32_t max_count = std::numeric_limits<uint32_t>::max();
+inline uint32_t filter_min = 2;
+inline uint32_t filter_max = std::numeric_limits<uint32_t>::max();
+inline uint32_t count_max = 255;
+inline uint32_t count_max_bytes = 1;
 
 // KmerTree的哈希表大小
 inline uint32_t kmer_concurrent_hash_map_capacity = 1024;
@@ -96,6 +98,10 @@ constexpr uint64_t KMER_BATCH_SIZE = 1024; // KmerBatch 的总大小（字节）
 // ExportWriter配置常量
 constexpr uint64_t EXPORT_FILES_SIZE = 1ULL << (2 * ROOT_BASES); // 最大同时打开文件数量
 constexpr uint64_t EXPORT_ROOT_BUFFER_SIZE = 512 * 1024;         // 每个根节点的导出缓冲区大小（字节）
+
+// FinalDrain 环形内存池配置
+constexpr uint64_t FINAL_DRAIN_RING_POOL_CAPACITY = 1ULL << 10;     // 1024 块
+constexpr uint64_t FINAL_DRAIN_RING_POOL_BLOCK_SIZE = 128ULL * 1024; // 128KB/块
 
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
 static_assert(KMER_BIN_SIZE < KMER_BLOCK_SIZE, "KMER_BIN_SIZE must be less than KMER_BLOCK_SIZE");
@@ -154,6 +160,15 @@ struct alignas(PAGE_SIZE) ExportBlock
     std::array<kmer<N>, EXPORT_RING_MEMORY_POOL_BLOCK_SIZE / sizeof(kmer<N>)> k_mers;
 };
 
+template <uint32_t N>
+struct concurrent_node
+{
+    static_assert(std::is_trivially_copyable_v<kmer<N>>, "kmer<N> must be trivially copyable");
+    kmer<N> k_mer;
+    concurrent_node* next{ nullptr };
+    std::atomic<uint32_t> count{ 0 };
+};
+
 // FinalDrain 导出使用的结构体
 template <uint32_t N>
 struct ExportRecord
@@ -168,7 +183,9 @@ alignas(CACHE_LINE_SIZE) inline std::atomic<uint64_t> sorted_kmer_count{ 0 };
 // 临时文件目录
 inline std::string temp_dir = "./tmp/";
 
-inline uint64_t standard_bloom_filter_capacity = 1ULL << 15; // 最低Bloom Filter容量，单位为元素数量
+// 布隆过滤器最大最小数目
+constexpr uint64_t MIN_BLOOM_FILTER_CAPACITY = 1ULL << 12; // 最低Bloom Filter容量，单位为元素数量
+inline uint64_t MAX_BLOOM_FILTER_CAPACITY = 1ULL << 20;      // 最大Bloom Filter容量，单位为元素数量
 
 // 布隆过滤器的容量
 inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> bloom_filter_capacity;
@@ -177,5 +194,10 @@ inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> bloom_filter_capacity;
 inline std::array<uint8_t, 1U << (2 * ROOT_BASES)> prefix_owners;
 
 inline std::array<void*, 1U << (2 * ROOT_BASES)> global_bloom_filter{};
+
+// prefix 对应的哈希表容量
+inline std::array<uint64_t, 1U << (2 * ROOT_BASES)> concurrent_map_capacity;
+
+inline uint8_t avgQuality = 0;
 
 #endif // TREE_DEFINITION_HEADER
